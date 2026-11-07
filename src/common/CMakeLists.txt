@@ -38,6 +38,8 @@ add_library(
     common_types.h
     concepts.h
     container_hash.h
+    core_pinning.cpp
+    core_pinning.h
     demangle.cpp
     demangle.h
     device_power_state.cpp
@@ -45,11 +47,14 @@ add_library(
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
+    nx2_sampler.cpp
+    nx2_sampler.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h
     error.cpp
     error.h
+    event_wait.h
     fiber.cpp
     fiber.h
     fixed_point.h

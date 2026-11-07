@@ -14,6 +14,8 @@
 #include <vector>
 #include <optional>
 #include <bit>
+#include <string>
+#include <utility>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -54,6 +56,9 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    debug_stats = std::getenv("EDEN_NX2_TC_LOG") != nullptr &&
+                  Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -787,6 +792,13 @@ bool TextureCache<P>::RescaleRenderTargets() {
 template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
+    struct ClearingScope {
+        bool& flag;
+        ~ClearingScope() {
+            flag = false;
+        }
+    } clearing_scope{clearing_render_targets};
+    clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
@@ -1074,10 +1086,20 @@ template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
+    // A deferred clear parked before this copy has to land before it: realizing it afterwards
+    // starts its clear pass after the copy and wipes what the copy wrote. That is what made
+    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
+    // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
+    // second frame. Texture cache copies bypass render passes and keep stream order here.
+    // Only when the copy proceeds: a rejected blit writes nothing and must not realize the
+    // clear ahead of the next draw that consumes it as its load-op. GetBlitImages cannot
+    // invalidate the parked clear: framebuffer removal flushes first (RemoveFramebuffers).
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
     }
+    runtime.FlushDeferredClear();
     const BlitImages images = *result;
     const ImageId dst_id = images.dst_id;
     const ImageId src_id = images.src_id;
@@ -2085,11 +2107,13 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
-        auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer);
+        auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
+                                    unswizzle_data_buffer, &unswizzle_worker);
         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
         image.UploadMemory(staging, copies);
     } else {
-        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);
+        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
+                                          mapped_span, &unswizzle_worker);
         image.UploadMemory(staging, copies);
     }
 }
@@ -2694,8 +2718,65 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(overlap_id);
     }
 
-    // TODO: Only upload what we need
-    RefreshContents(new_image, new_image_id);
+    // A new render target that the clear binding it overwrites whole (every channel, the whole
+    // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
+    // frame outdoors, and uploading them was ~15% of the GPU back thread.
+    const auto overwritten_by_clear = [&] {
+        if (!clearing_render_targets || !join_copies_to_do.empty() ||
+            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
+            new_info.resources.layers != 1 || new_info.num_samples != 1) {
+            return false;
+        }
+        const auto& regs = maxwell3d->regs;
+        const auto& surface = regs.clear_surface;
+        if (surface.layer != 0) {
+            return false;
+        }
+        const u32 width = new_info.size.width;
+        const u32 height = new_info.size.height;
+        if (!ClearCovers(width, height)) {
+            return false;
+        }
+        // The clear covers the framebuffer's render area, the smallest bound target.
+        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+            const auto& rt = regs.rt[index];
+            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                (rt.width < width || rt.height < height)) {
+                return false;
+            }
+        }
+        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+            return false;
+        }
+        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
+        case VideoCore::Surface::SurfaceType::ColorTexture: {
+            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+            const u32 index = surface.RT;
+            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+                   regs.rt[index].Address() == gpu_addr;
+        }
+        case VideoCore::Surface::SurfaceType::Depth:
+            return is_depth_target && surface.Z;
+        case VideoCore::Surface::SurfaceType::Stencil:
+            return is_depth_target && full_stencil;
+        case VideoCore::Surface::SurfaceType::DepthStencil:
+            return is_depth_target && surface.Z && full_stencil;
+        default:
+            return false;
+        }
+    };
+    if (overwritten_by_clear()) {
+        // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
+        // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
+        runtime.TransitionImageLayout(new_image);
+    } else {
+        // TODO: Only upload what we need
+        RefreshContents(new_image, new_image_id);
+    }
 
     if (can_rescale) {
         ScaleUp(new_image);
@@ -2922,6 +3003,11 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) 
 template <class P>
 std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                      bool mark_as_modified) {
+    // As in BlitImage: land a parked deferred clear before the DMA write, but only when the
+    // write happens (mark_as_modified); a read-only access writes nothing.
+    if (mark_as_modified) {
+        runtime.FlushDeferredClear();
+    }
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
@@ -3224,6 +3310,8 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image.channel = current_channel_id;
+    image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
@@ -3253,6 +3341,37 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
 }
 
 template <class P>
+void TextureCache<P>::ReportMissingImagePage(ImageId image_id, const Image& image, u64 page) {
+    std::string spaces;
+    for (const auto& [id, ref] : address_spaces) {
+        spaces += fmt::format(" {}->{}", id, ref.storage_id);
+    }
+    std::string holders;
+    for (size_t index = 0; index < gpu_page_table_storage.size(); ++index) {
+        const auto& table = gpu_page_table_storage[index];
+        const auto it = table.find(page);
+        if (it == table.end()) {
+            continue;
+        }
+        const bool has_image = std::ranges::find(it->second, image_id) != it->second.end();
+        holders += fmt::format(" {}{}{}", index / 2, index % 2 == 0 ? "" : "s",
+                               has_image ? "+image" : "");
+    }
+    const ImageInfo& info = image.info;
+    LOG_CRITICAL(HW_GPU,
+                 "Unregistering image {} at {:#x}+{:#x} (type {} format {} {}x{}x{} levels {} "
+                 "layers {} flags {:#x}): page {:#x} is missing; registered on channel {} address "
+                 "space {}, now channel {} address space {}; address space->storage:{}; tables "
+                 "holding the page:{}",
+                 image_id.index, image.gpu_addr, image.guest_size_bytes,
+                 static_cast<u32>(info.type), static_cast<u32>(info.format), info.size.width,
+                 info.size.height, info.size.depth, info.resources.levels, info.resources.layers,
+                 static_cast<u32>(image.flags), page << YUZU_PAGEBITS, image.channel,
+                 image.address_space, current_channel_id, current_address_space, spaces,
+                 holders.empty() ? " none" : holders);
+}
+
+template <class P>
 void TextureCache<P>::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
@@ -3260,10 +3379,14 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
     lru_cache.Free(image.lru_index);
+    bool reported_missing_page = false;
     const auto& clear_page_table =
-        [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
+        [this, image_id, &image, &reported_missing_page](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
             const auto page_it = selected_page_table.find(page);
             if (page_it == selected_page_table.end()) {
+                if (!std::exchange(reported_missing_page, true)) {
+                    ReportMissingImagePage(image_id, image, page);
+                }
                 ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
                 return;
             }
@@ -3679,6 +3802,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         // same guest data, which is uploaded from guest memory instead.
         return;
     }
+    // As in BlitImage: land a parked deferred clear before the copy overwrites the image.
+    runtime.FlushDeferredClear();
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
@@ -3816,19 +3941,36 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const ImageViewBase& image_view = slot_image_views[id];
     const ImageBase& image = slot_images[image_view.image_id];
     const Extent3D size = image_view.size;
-    const auto& regs = maxwell3d->regs;
-    const auto& scissor = regs.scissor_test[0];
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
     }
+    // Make sure the clear covers all texels in the subresource
+    return ClearCovers(size.width, size.height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
+    const auto& regs = maxwell3d->regs;
+    // The render area is the surface clip's size.
+    if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
+        return false;
+    }
     if (regs.clear_control.use_scissor == 0) {
-        // If scissor testing is disabled, the clear is always full
         return true;
     }
-    // Make sure the clear covers all texels in the subresource
-    return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
-           scissor.max_y >= size.height;
+    // With a lower-left window origin, the clear's scissor is flipped around the surface clip's
+    // height (GetScissorState).
+    const auto& scissor = regs.scissor_test[0];
+    const bool lower_left =
+        regs.window_origin.mode != Tegra::Engines::Maxwell3D::Regs::WindowOrigin::Mode::UpperLeft;
+    const s32 clip_height = static_cast<s32>(regs.surface_clip.height.Value());
+    const s32 min_y = static_cast<s32>(scissor.min_y.Value());
+    const s32 max_y = static_cast<s32>(scissor.max_y.Value());
+    const s32 top = lower_left ? clip_height - max_y : min_y;
+    const s32 bottom = lower_left ? clip_height - min_y : max_y;
+    return scissor.min_x == 0 && top <= 0 && scissor.max_x >= width &&
+           bottom >= static_cast<s32>(height);
 }
 
 template <class P>
@@ -3839,6 +3981,9 @@ void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
     this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
     this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
+    LOG_INFO(HW_GPU, "Texture cache channel {} (slot {}): address space {}, storage {} of {}",
+             channel.bind_id, it->second, channel.memory_manager->GetID(), this_as_ref.storage_id,
+             address_spaces.size());
 }
 
 /// Bind a channel for execution.

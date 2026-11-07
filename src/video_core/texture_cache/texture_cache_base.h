@@ -46,6 +46,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
+#include "video_core/textures/unswizzle_worker.h"
 
 namespace Tegra {
 namespace Control {
@@ -144,7 +145,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
-    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -462,6 +463,9 @@ private:
     /// Unregister image from the page table
     void UnregisterImage(ImageId image);
 
+    /// Logs where UnregisterImage's image was registered when one of its pages is missing.
+    void ReportMissingImagePage(ImageId image_id, const Image& image, u64 page);
+
     /// Track CPU reads and writes for image
     void TrackImage(ImageBase& image, ImageId image_id);
 
@@ -504,6 +508,9 @@ private:
 
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
+
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
@@ -556,6 +563,9 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
+    /// skip the upload of a new target the clear overwrites whole.
+    bool clearing_render_targets = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
@@ -626,6 +636,7 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;

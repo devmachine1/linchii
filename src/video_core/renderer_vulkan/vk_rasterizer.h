@@ -107,13 +107,17 @@ public:
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
                                              bool past_sync) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool HasPendingQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
+    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
@@ -124,6 +128,7 @@ public:
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;
+    void FlushQueryResults(DAddr addr, u64 size) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
@@ -193,7 +198,9 @@ private:
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
 
-    void UpdateDynamicStates();
+    /// Records the dynamic state of the draw being prepared with `pipeline` (null for
+    /// DrawTexture's blit).
+    void UpdateDynamicStates(const GraphicsPipeline* pipeline);
 
     void HandleTransformFeedback();
 
@@ -225,12 +232,16 @@ private:
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs, const GraphicsPipeline* pipeline);
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void FrameDumpPass(const Framebuffer* framebuffer);
+    /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
+    void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+    /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
+    bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -259,8 +270,6 @@ private:
     FenceManager fence_manager;
     FrameDump frame_dump;
 
-    vk::Event wfi_event;
-
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
@@ -271,6 +280,8 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// Fragment output components the dynamic color write mask was last recorded with
+    u32 last_color_output_mask{};
 
     struct IndirectTrace {
         vk::Buffer readback;
