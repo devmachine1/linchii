@@ -287,6 +287,7 @@ public:
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
     u8* backing_base{};
+    bool backing_shared{};
     u8* virtual_base{};
 
 private:
@@ -649,6 +650,7 @@ public:
             }
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
+            backing_shared = true;
         }
         if (backing_base == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "mmap failed: {}", strerror(errno));
@@ -814,6 +816,7 @@ public:
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
     u8* backing_base{reinterpret_cast<u8*>(MAP_FAILED)};
+    bool backing_shared{};
     u8* virtual_base{reinterpret_cast<u8*>(MAP_FAILED)};
     u8* virtual_map_base{reinterpret_cast<u8*>(MAP_FAILED)};
 
@@ -988,6 +991,7 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment), AlignUp(virtual_size, PageAlignment) + HugePageSize);
     if (impl->Init()) {
         backing_base = impl->backing_base;
+        backing_shared = impl->backing_shared;
         virtual_base = impl->virtual_base;
         if (virtual_base) {
             // Ensure the virtual base is aligned to the L2 block size.
@@ -1090,8 +1094,11 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.
         VirtualUnlock(address, length);
-#elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
+#elif defined(__linux__) && defined(MADV_COLD)
+        // MADV_COLD only deactivates the pages, like VirtualUnlock. MADV_PAGEOUT writes them to
+        // swap right away while holding the mmap lock, which stalled every guest core for 3-15 s
+        // (zortos293/Lichii#756).
+        madvise(address, length, MADV_COLD);
 #else
         static_cast<void>(address);
 #endif
@@ -1119,6 +1126,17 @@ bool IsZeroPage(const u8* page) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+#endif
+#if defined(__linux__)
+bool IsZeroPage(const u8* page) {
+    const auto* words = reinterpret_cast<const volatile u64*>(page);
+    for (size_t i = 0; i < 4096 / sizeof(u64); ++i) {
+        if (words[i] != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 #endif
 } // namespace
@@ -1185,6 +1203,64 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
     }
     flush();
     return {pages.size() * 4096, trimmed};
+#elif defined(__linux__)
+    if (backing_base == nullptr) {
+        return {0, 0};
+    }
+    // Resident pages only: mincore says which are in RAM, so pages swapped out are not faulted
+    // back in (reading them would be I/O). All-zero pages are then released: MADV_REMOVE punches
+    // the shared tmpfs backing (a hole reads back as zeros, and the pages leave system memory),
+    // MADV_DONTNEED zero-fills the private anonymous fallback. The check and the release happen
+    // back to back, so a write landing in between is the only way a page could be lost.
+    constexpr size_t ChunkSize = size_t{256} << 10;
+    constexpr size_t PageSize = 4096;
+    std::vector<unsigned char> residency;
+    size_t resident = 0;
+    size_t trimmed = 0;
+    const auto release = [&](size_t offset, size_t length) {
+        // The shared backing is a memfd: punching a hole frees its pages (reads come back zero),
+        // the primitive ClearBackingRegion uses for granules it cleared.
+        if (backing_shared && impl && impl->PunchHole(offset, length)) {
+            trimmed += length;
+            return;
+        }
+        if (madvise(backing_base + offset, length, MADV_DONTNEED) == 0) {
+            trimmed += length;
+        }
+    };
+    for (size_t offset = 0; offset < backing_size; offset += ChunkSize) {
+        const size_t length = (std::min)(ChunkSize, backing_size - offset);
+        const size_t pages = length / PageSize;
+        residency.resize(pages);
+        if (mincore(backing_base + offset, length, residency.data()) != 0) {
+            continue;
+        }
+        size_t run_begin = 0;
+        bool in_run = false;
+        const auto flush = [&](size_t run_end) {
+            if (in_run) {
+                release(offset + run_begin, run_end - run_begin);
+                in_run = false;
+            }
+        };
+        for (size_t page = 0; page < pages; ++page) {
+            if ((residency[page] & 1) == 0) {
+                flush(page * PageSize);
+                continue;
+            }
+            ++resident;
+            if (!IsZeroPage(backing_base + offset + page * PageSize)) {
+                flush(page * PageSize);
+                continue;
+            }
+            if (!in_run) {
+                run_begin = page * PageSize;
+                in_run = true;
+            }
+        }
+        flush(pages * PageSize);
+    }
+    return {resident * PageSize, trimmed};
 #else
     return {0, 0};
 #endif
