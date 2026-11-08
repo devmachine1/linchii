@@ -169,6 +169,13 @@ private:
         return t_cache;
     }
 
+public:
+    /// Changes whenever Map or Unmap changes which host memory a device page reads: host
+    /// pointers kept from before are stale.
+    [[nodiscard]] u64 TranslationGeneration() const {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
     // Internal helper that performs the update assuming the caller already holds the necessary lock.
     void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
 

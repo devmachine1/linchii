@@ -355,15 +355,14 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     };
 
     scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+        // The last real frame becomes the history and this one the current copy, before the flow
+        // reads them: Generate() interpolates between the two. Copying the new frame into both
+        // after the flow made every generated frame the newest frame blended with itself.
         CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
         CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
 
-        const auto barrier = MakeBarrier(*m_motion_image,
-                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                         VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                         VK_IMAGE_LAYOUT_GENERAL);
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+        // Transition motion image to GENERAL for storage write
+        TransitionImageLayout(cmdbuf, *m_motion_image, VK_IMAGE_LAYOUT_GENERAL);
 
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *m_flow_pipe_layout, 0,

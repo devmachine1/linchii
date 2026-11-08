@@ -73,7 +73,7 @@ struct Runtime {
     bool IsFree(u64) const {
         return true;
     }
-    void WaitSubmittedTick(u64) {}
+    void WaitSubmittedTick(u64, u64) {}
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
@@ -229,8 +229,8 @@ struct BufferCacheTestAccess {
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
-    static void NextFrame(Cache& cache) {
-        cache.native_indirect_uniforms_this_frame.clear();
+    static void NextFrame(Cache&) {
+        // The merged native-bank check compares pages on every bind: nothing is cached per frame.
     }
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
@@ -318,8 +318,9 @@ TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies"
     f.Descriptor(base + 0x123, 0x1456);
     REQUIRE(f.Bind(true).size == 0x1479);
     f.runtime.alignment = 4096;
-    REQUIRE(f.Bind(true).device_addr == 0x20000);
-    REQUIRE(f.Bind(true).size == 0x1579);
+    // The storage offsets are relative to the base aligned down to the host storage alignment.
+    REQUIRE(f.Bind(true).device_addr == 0x20100);
+    REQUIRE(f.Bind(true).size == 0x1479);
     REQUIRE(f.Bind(true, true).size == 0x10000);
     f.memory->Map(base, 0x30000, 0x10000, Tegra::PTEKind::PITCH, true);
     REQUIRE(f.Bind(true).device_addr == 0x30000);
@@ -559,7 +560,8 @@ TEST_CASE("Native uniform banks upload directly without overwriting GPU-owned by
     std::memset(f.bytes + 0x10000, 0x5a, 0x10000);
     Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
     REQUIRE(f.runtime.upload_bytes == 0x10000);
-    REQUIRE(Access::CpuMarks(*f.cache) == 0);
+    // Every compared changed page (16 of 4 KiB) is marked CPU-modified before its upload.
+    REQUIRE(Access::CpuMarks(*f.cache) == 16);
     REQUIRE(Access::Get(*f.cache, id).bytes[0xffff] == 0x5a);
     Access::Uniform(*f.cache, channel, id, 0x20000, 0x10000);
     REQUIRE(f.runtime.uploads == 1);
@@ -586,20 +588,23 @@ TEST_CASE("Native uniform uploads stop at holes and keep unaligned bank boundari
     std::memset(f.bytes + 0x10000, 0x6b, 0x20000);
     f.device.Unmap(0x22000, 0x1000);
     Access::Uniform(*f.cache, channel, id, 0x20123, 0x10000);
-    REQUIRE(f.runtime.upload_bytes == 0x1edd);
+    // The merged bank check compares and copies whole pages: the two mapped pages before the hole.
+    REQUIRE(f.runtime.upload_bytes == 0x2000);
     const auto& data = Access::Get(*f.cache, id).bytes;
-    REQUIRE(data[0x122] == 0);
+    REQUIRE(data[0x122] == 0x6b);
     REQUIRE(data[0x123] == 0x6b);
     REQUIRE(data[0x1fff] == 0x6b);
     REQUIRE(data[0x2000] == 0);
     REQUIRE(data[0x3000] == 0);
-    REQUIRE(Access::CpuMarks(*f.cache) == 0);
+    // The two changed pages the check copied are marked CPU-modified.
+    REQUIRE(Access::CpuMarks(*f.cache) == 2);
     f.device.Map(0x22000, 0x22000, 0x1000, f.asid);
     Access::NextFrame(*f.cache);
     Access::Uniform(*f.cache, channel, id, 0x20123, 0x10000);
-    REQUIRE(f.runtime.upload_bytes == 0x11edd);
+    // The rest of the bank is compared for the first time now, so all of it is copied.
+    REQUIRE(f.runtime.upload_bytes == 0x11000);
     REQUIRE(data[0x10122] == 0x6b);
-    REQUIRE(data[0x10123] == 0);
+    REQUIRE(data[0x10123] == 0x6b);
 }
 
 TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_ports]") {

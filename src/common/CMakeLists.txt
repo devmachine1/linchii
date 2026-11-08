@@ -59,6 +59,8 @@ add_library(
     fiber.h
     fixed_point.h
     free_region_manager.h
+    frizti_settings.cpp
+    frizti_settings.h
     fs/file.cpp
     fs/file.h
     fs/fs.cpp
@@ -128,6 +130,12 @@ add_library(
     swap.h
     thread.cpp
     thread.h
+    thread_pinning.cpp
+    thread_pinning.h
+    nx2_sample_profile.cpp
+    nx2_timeline.cpp
+    nx2_timeline.h
+    nx2_sample_profile.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
     adpf.cpp
@@ -269,6 +277,12 @@ endif()
 if(ANDROID)
     # For ASharedMemory_create
     target_link_libraries(common PRIVATE android)
+endif()
+
+if (MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS_RELEASE MATCHES "-flto")
+    # As the kernel (src/core): fibers migrate between host threads, and with a newer Ocarina PGO
+    # profile ThinLTO dropped Fiber's definitions that the kernel's plain objects call.
+    set_source_files_properties(fiber.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
 create_target_directory_groups(common)

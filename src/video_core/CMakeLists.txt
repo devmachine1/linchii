@@ -111,6 +111,9 @@ add_library(video_core STATIC
     memory_manager.cpp
     memory_manager.h
     page_filter.h
+    pipeline_cache_files.cpp
+    pipeline_cache_files.h
+    pipeline_cache_policy.h
     native_qmd.h
     native_query_trace.h
     nx2.h
@@ -118,6 +121,8 @@ add_library(video_core STATIC
     nx2_debug_control.cpp
     nx2_debug_control.h
     nx2_profile.h
+    nx2_qmd_prediction.cpp
+    nx2_qmd_prediction.h
     nx2_perf.h
     nx2_download_trace.h
     pending_maps.h
@@ -205,6 +210,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_descriptor_pool.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
+    renderer_vulkan/vk_flash_watch.cpp
+    renderer_vulkan/vk_flash_watch.h
     renderer_vulkan/vk_frame_dump.cpp
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
@@ -217,6 +224,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
+    renderer_vulkan/vk_host_pacer.cpp
+    renderer_vulkan/vk_host_pacer.h
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
     renderer_vulkan/vk_rasterizer.cpp

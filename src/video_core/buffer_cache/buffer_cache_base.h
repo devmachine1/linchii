@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
@@ -272,6 +274,9 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
+    /// DownloadMemory for each range, waiting for the GPU once.
+    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
+
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
@@ -374,7 +379,8 @@ public:
         }
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
-    bool Nx2CopyListPages(u64 tick);
+    /// `writer`: the dispatch's shader hash, 0 for a DMA copy (EDEN_NX2_LIST_WAIT_TRACE).
+    bool Nx2CopyListPages(u64 tick, u64 writer = 0);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
@@ -384,7 +390,9 @@ public:
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
-
+    /// The split's back, the front waiting on it: downloads `pages` and every page draws wrote
+    /// since it was last flushed with one GPU wait, and notes the latter synced. Each page's next
+    /// lists then read guest memory instead of draining and flushing one page at a time.
     void Nx2FlushListPages(std::span<const DAddr> pages);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
@@ -394,7 +402,7 @@ public:
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
-    /// host buffer holding each range, if one does, for diagnostics. Nothing is
+    /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
     /// created or synchronized. Stage 5 is compute.
     template <typename Func>
     void ForEachBoundBuffer(bool compute, Func&& func) {
@@ -470,8 +478,57 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
-    /// Indirectly read banks of native programs already uploaded this frame.
-    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// The guest words of each page of native programs' indirectly read banks when last checked:
+    /// unchanged pages keep their tracking (marking them CPU-modified costs two mprotect calls
+    /// per page).
+    struct NativeBankPage {
+        std::array<u8, Core::DEVICE_PAGESIZE> words;
+        /// EDEN_NX2_EXP4 & 2: the bytes of the page compared during draw `checked_draw`.
+        u64 checked_draw = 0;
+        u32 checked_begin = 0;
+        u32 checked_end = 0;
+        /// EDEN_NX2_EXP9: frame_tick of the page's last compare, and whether the next bind
+        /// compares it again (a flagged write's bytes may land after the compare that took it).
+        u64 checked_frame = ~u64{0};
+        /// frame_tick when the page was last seen changed: such pages are compared on every bind.
+        u64 changed_frame = ~u64{0};
+        bool recheck = false;
+    };
+    std::unordered_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
+    u64 native_bank_draw = 0;
+    /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.
+    struct NativeBankCheckStats {
+        u64 binds = 0;
+        u64 bytes_compared = 0;
+        u64 bytes_trimmed = 0;
+        u64 pages_compared = 0;
+        u64 pages_skipped = 0;
+        u64 pages_changed = 0;
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_stats;
+    /// EDEN_NX2_EXP9 != 0: why bank pages were compared and which of them had changed, by the
+    /// first reason that applies (NativeBankReason), logged every 5 s.
+    /// EDEN_NX2_EXP9: a page that changed within this many frames is compared on every bind.
+    static constexpr u64 HotFrames = 120;
+    enum NativeBankReason : size_t {
+        BankCollected, ///< Collected CPU writes (Core::g_collected_write_pages)
+        BankWritten,   ///< Writes the buffer cache saw (Core::g_buffer_write_pages)
+        BankRecheck,   ///< Flagged at the previous bind
+        BankCpuDirty,  ///< CPU-modified in the tracker
+        BankHot,       ///< Changed within the last HotFrames frames (per-draw data)
+        BankFrame,     ///< Not compared yet this frame
+        BankNone,      ///< No reason: EXP9=2 compares these only to verify
+        BankReasons,
+    };
+    struct NativeBankTrackedStats {
+        u64 binds = 0;
+        u64 pages_new = 0;
+        u64 pages_skipped = 0;
+        std::array<u64, BankReasons> compared{};
+        std::array<u64, BankReasons> changed{};
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_tracked_stats;
 
 private:
     template <typename Mask, typename Func>
@@ -517,6 +574,9 @@ private:
     void BindHostGraphicsUniformBuffers(size_t stage);
 
     void BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+
+    /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
+    void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode);
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
@@ -682,6 +742,22 @@ private:
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
 
+    /// Experiment, EDEN_NX2_WRITTEN_SSBO_MARK_KIB=<n>: marks at most n KiB of a written Switch 2
+    /// storage buffer binding GPU-written. Native pointers carry no size, so a written binding
+    /// spans up to 8 MiB of its mapping and arms read traps and fence downloads over CPU data
+    /// the shader never writes. Writes past the cap are not tracked, so this only measures how
+    /// much of the marked range the GPU really writes.
+    u32 WrittenStorageMarkSize(u32 size) const {
+        static const u64 cap = [] {
+            const char* value = std::getenv("EDEN_NX2_WRITTEN_SSBO_MARK_KIB");
+            return value == nullptr ? u64{0} : std::strtoull(value, nullptr, 10) * 1024;
+        }();
+        if (cap == 0 || gpu_memory == nullptr || !gpu_memory->UsesNativeTiling()) {
+            return size;
+        }
+        return static_cast<u32>((std::min<u64>)(size, cap));
+    }
+
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
@@ -701,12 +777,15 @@ private:
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
+        // Preflushed writes arm the read traps too: their data reaches guest memory only when
+        // the fence's download lands, and a read before that saw stale words (Ocarina of Time's
+        // whole screen flashed white at the sword boulder, ~180 times in 30 s). The trapped read
+        // flushes on demand only while the data is still in flight (GetFlushArea).
         if (!exact) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
-            } else {
-                ArmReadTraps(device_addr, size);
             }
+            ArmReadTraps(device_addr, size);
             return;
         }
         const DAddr end = device_addr + size;
@@ -719,8 +798,9 @@ private:
                 queued += upper - lower;
             }
         });
-        if (queued < size) {
-            ArmReadTraps(device_addr, size);
+        ArmReadTraps(device_addr, size);
+        if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
+            Nx2DownloadTrace::Queued(device_addr, size, queued);
         }
         if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
             Nx2DownloadTrace::Queued(device_addr, size, queued);
@@ -773,6 +853,47 @@ private:
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;
+
+    /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
+    /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or
+    /// deleted (ChangeRegister) and when the inline index buffer is replaced.
+    u64 binding_epoch = 1;
+
+    /// The last BindGraphicsUniformBuffer of a (stage, slot) and what it translated to, valid
+    /// while that binding is the one it set (EXP18 & 1).
+    struct UniformBindMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr gpu_addr{};
+        DAddr device_addr{};
+        u32 size{};
+    };
+    std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_bind_memo{};
+
+    /// One storage binding's last lookup when it resolved to a single buffer (no segments)
+    /// (EXP18 & 2). Index NUM_STAGES is compute.
+    struct StorageBindingMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        DAddr device_addr{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+        bool is_written{};
+        BufferId buffer_id{};
+    };
+    std::array<std::array<StorageBindingMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1>
+        storage_binding_memo{};
+
+    /// FindBuffer and ResolveMultiRangeStorage for one storage binding, from its memo when
+    /// nothing they depend on changed.
+    void ResolveStorageBinding(size_t memo_stage, u32 index, Binding& binding, bool is_written,
+                               std::vector<MultiRangeSegment>& pool);
+
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
@@ -798,6 +919,7 @@ private:
         u64 synced_writes{~u64{0}};
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
+        u64 copy_writer{}; ///< What recorded the copy (Nx2CopyListPages)
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
         /// once: the front can't tell from what it sent which draws write the page, so it reads
         /// no copy. A draw's writes reach a pushbuffer fetch only after a host-level wait, so

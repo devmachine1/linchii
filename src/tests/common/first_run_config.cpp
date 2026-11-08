@@ -92,12 +92,14 @@ void CheckFreshProfile() {
 }
 
 void CheckLegacyProfile() {
+    // An existing config without these keys takes the build's defaults, which the tuned
+    // (Fritchii) profile made the tuned values themselves; only the seeded scaling filter differs.
     const auto& values = Settings::values;
     CHECK(values.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
-    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
-    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Cpu);
-    CHECK_FALSE(values.async_presentation.GetValue());
-    CHECK_FALSE(values.use_asynchronous_shaders.GetValue());
+    CHECK(values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
+    CHECK(values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
+    CHECK(values.async_presentation.GetValue());
+    CHECK(values.use_asynchronous_shaders.GetValue());
 }
 
 void CheckUnchangedProfile() {
@@ -110,8 +112,8 @@ void CheckUnchangedProfile() {
     CHECK(values.slow_speed_limit.GetValue() == 50);
     CHECK(values.turbo_speed_limit.GetValue() == 200);
     CHECK_FALSE(values.sync_core_speed.GetValue());
-    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb);
-    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Fifo);
+    CHECK(values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_8Gb);
+    CHECK(values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
     CHECK(values.fsr_sharpening_slider.GetValue() == 25);
     CHECK(values.dma_accuracy.GetValue() == Settings::DmaAccuracy::Default);
     CHECK(values.gpu_fence_behavior.GetValue() == Settings::GpuFenceBehavior::Default);
@@ -171,7 +173,11 @@ TEST_CASE("Absent global config receives the first-run profile and persists it",
     file.close();
     for (const char* key : {"scaling_filter", "gpu_accuracy", "nvdec_emulation",
                             "async_presentation", "use_asynchronous_shaders"}) {
-        CHECK_FALSE(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(), true));
+        // The marker is true when the seeded value equals the (tuned) default; only the scaling
+        // filter is seeded away from its default.
+        const bool marker = std::string_view{key} != "scaling_filter";
+        CHECK(saved.GetBoolValue("Renderer", (std::string{key} + "\\default").c_str(),
+                                 !marker) == marker);
     }
     const auto filename = config->GetConfigFilePath();
     config.reset();
@@ -274,7 +280,8 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
         CHECK(Settings::values.scaling_filter.GetValue() == Settings::ScalingFilter::Bilinear);
         CHECK(Settings::values.scaling_filter.GetValue(true) == Settings::ScalingFilter::Fsr3);
         CHECK_FALSE(Settings::values.gpu_accuracy.UsingGlobal());
-        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::High);
+        // The game's value equals the tuned default, so its default marker defers to the global one.
+        CHECK(Settings::values.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.gpu_accuracy.GetValue(true) == Settings::GpuAccuracy::Low);
         CHECK(Settings::values.nvdec_emulation.UsingGlobal());
         CHECK(Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);

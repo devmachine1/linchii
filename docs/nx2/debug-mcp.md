@@ -184,24 +184,18 @@ it with `SetGlobalFilter` (`logging.cpp:449`), the call the Qt settings dialog m
 already filtered out were never formatted, so the new filter applies only to later lines.
 
 **`capture_frame`** `{sampled?, buffers?, timeout_s?, manifest_lines?, index?}`. It reuses
-`FrameDump`. `FrameDump::Arm` (`vk_frame_dump.cpp:268`) points the next capture at a fresh directory and resets
-the per-capture counters, so `EDEN_NX2_FRAME_DUMP` is not needed. When to capture is decided by
-`FrameDumpSchedule`, which has no Vulkan state and is unit-tested. It handles both the env
-triggers and the debug server's requests. It also sets `RecordingSampledTextures`, which the
-graphics and compute pipelines check before they keep the textures each draw and dispatch
-samples. The pipelines used to read `EDEN_NX2_FRAME_DUMP_SAMPLED` once at startup, so a sampled
-request at runtime found no sampled textures to read back. Now the pipelines keep them only during
-a sampled capture, under either trigger. With `buffers: true` the capture also records the uniform
-and storage buffers the buffer cache bound for every draw and dispatch (`kind: buffer`, with stage,
-binding, GPU address and size; bytes deduplicated in `buffer_<hash>.bin.zst`, copied on the GPU
-when the GPU wrote the range) and each dispatch's group counts (`kind: launch`). This is the
-buffer part of fix/oot-fog's frame dump (1ad14bebb8). `EDEN_NX2_FRAME_DUMP_SAMPLED` turns on both
-textures and buffers. At runtime they are separate, so diffing a constant buffer such as a fog
-`c5` across two captures does not pay for every texture readback. `FrameDump::TickFrame`
-(`vk_frame_dump.cpp:849`) starts the capture exactly as `capture.now` would. The writer thread
-reports completion after it writes the manifest summary (`WriterLoop`, `vk_frame_dump.cpp:710`). The tool returns the directory, the
-frame and summary lines, counts per entry kind, the first entries, and the `frame_dump_index.py`
-command. With `index: true`, the adapter runs that command itself. The adapter-only
+`FrameDump`. `FrameDump::RequestDebugCapture` (`vk_frame_dump.cpp`) points the next capture at the
+request's directory and resets the per-capture counters, so `EDEN_NX2_FRAME_DUMP` and
+`capture.now` are not needed; the GPU thread's `TickFrame` starts that capture on the next
+presented frame, exactly as the file trigger would. `sampled: true` reads back the textures each
+draw and dispatch samples and, as with `EDEN_NX2_FRAME_DUMP_SAMPLED`, also records the uniform and
+storage buffers the buffer cache bound (`kind: buffer`, with stage, binding, GPU address and size;
+bytes deduplicated in `buffer_<hash>.bin.zst`, copied on the GPU when the GPU wrote the range) and
+each dispatch's group counts (`kind: launch`). `buffers: true` implies the sampled readback. The
+writer thread reports completion after it writes the manifest summary (`WriterLoop`), and the
+request is finished once that summary is on disk. The tool returns the directory, the frame and
+summary lines, counts per entry kind, the first entries, and the `frame_dump_index.py` command.
+With `index: true`, the adapter runs that command itself. The adapter-only
 `capture_image {directory, name}` returns one pass PNG as image content.
 
 **`sample`** `{threads?, seconds?, max_chars?}`. The in-process sampling profiler
@@ -338,6 +332,58 @@ Use it when the owner has put the controller down: injected buttons add to whate
 presses. For an A/B test, run the same `input_sequence` from the same spot under each variant
 (for example with a `reject_shaders` change in between), then compare screenshots or captures.
 
+**`input_record`** records what the game receives while the owner plays, so the agent can replay
+it later:
+
+- `{"action": "start", "controller"?: "player1" | "handheld"}` starts sampling (default: player 1,
+  or the handheld controller when player 1 is not connected). It is refused while a recording
+  runs or while debug server input is injected into that controller. Starting again discards a
+  recording whose file could not be written.
+- `{"action": "status"}` returns `{recording, unsaved, controller, first_present, frames, steps,
+  missed, full}`.
+- `{"action": "stop", "path"?: "<file>"}` stops and writes the file (default
+  `input_<unix ms>.json` in the dump directory; a relative path is under it). It returns the
+  status plus `path`. When the write fails the recording is kept, and `stop` again retries it.
+
+A dedicated thread polls `g_nx2_present_count` every 0.5 ms (the frontends set the Windows timer
+to its finest resolution). When the count moves to P, it reads `GetNpadButtons` and `GetSticks`
+of the controller, the getters the npad service reads, and records that as the input of present
+P: exactly what `input_sequence` replays while the count is P. If the count jumped by more than
+one, the presents in between get the previous sample and are counted in `missed`. Buttons are
+reduced to the ones `ParseInputStep` accepts; sticks are quantized to 1/1024 of full scale, and
+an axis below 0.02 is 0, so a held stick merges into one step. Both sticks are always written,
+so a replay owns the sticks (owner drift does not leak in); buttons the owner presses during a
+replay are still ORed in. Equal consecutive presents merge into one step, and a step is split at
+36000 frames. Sampling stops by itself at 864000 frames (4 hours at 60 fps), `full` in the
+status.
+
+The file is one step per line:
+
+```
+{"version":1,"controller":"player1","first_present":5321,"frames":1830,"missed":0,"steps":[
+{"buttons":["A"],"frames":4,"left_stick":[0.0,0.0],"right_stick":[0.0,0.0]},
+{"frames":120,"left_stick":[0.0,1.0],"right_stick":[0.0,0.0]},
+...
+]}
+```
+
+Every entry of `steps` is an `input_sequence` step. A file within 1000 steps and 36000 frames can
+be fed to `input_sequence` as is; chunks of a longer one would leave gaps between calls, so play
+it with **`input_replay`** `{"path": "<file>", "at_present"?: N, "controller"?: ..., "timeout_s"?}`
+instead: one run of the whole file (at most 864000 frames) through the same injector, which finds
+the active step by binary search. It starts at the next present, or at absolute present count
+`at_present` (refused once that has been presented; the count restarts at 0 on every boot), and
+uses the file's controller unless `controller` is given. It returns like `input_sequence`, plus
+`path`. Like every handler it runs on the server thread, so the server answers nothing else
+until it ends.
+
+Not recorded: analog triggers (GC), motion, touch, mouse and keyboard, Home and Capture, the
+debug pad, and controllers other than the one named. Timing is per present: a press shorter
+than a frame is lost or stretched to a frame, and an input the game read a little after the
+present it changed in may land one frame early or late. The replay is frame-exact relative to
+its own start; it matches the recording only if it starts from the same game state at the same
+point (for example right after the same save is loaded, or at the same `at_present` after boot).
+
 ### Phase 2: control and input (about 4 to 5 days)
 
 - **pause, resume, step_frames.** The core has `System::Pause` and `Run` (`src/core/core.cpp:279`).
@@ -347,7 +393,7 @@ presses. For an A/B test, run the same `input_sequence` from the same spot under
   pause button uses. `step_frames {n}` resumes, waits until `g_nx2_present_count` advances by
   `n`, then pauses. That is present-granular, not exact, because the GPU drains a frame or two
   behind the CPU. Use a capture to get an exact frame.
-- **input** and **input_sequence** are done; see "Input".
+- **input**, **input_sequence**, **input_record** and **input_replay** are done; see "Input".
 - **shaders.** An inventory from `ShaderCache::lookup_cache` (key, hash, size, address) and
   `rejected_native` (address plus the exception message), copied on the rasterizer thread like
   the reject change. Each entry carries its stage and whether it was lowered, rejected by the
@@ -385,7 +431,8 @@ The core cannot save state. There is no serialisation of the kernel, services, t
 NCE CPU state, or the GPU caches, and Eden and yuzu never had it. The `saveState` in
 `src/yuzu/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
 not a tool. The practical substitute is a reproduction script: phase 2 input sequences, recorded
-once (`EDEN_NX2_KEY_RECORD` already records keys in `eden-cli`) and replayed after boot.
+once with `input_record` and replayed with `input_replay` after the same save is loaded
+(`EDEN_NX2_KEY_RECORD` in `eden-cli` records keys by wall time instead).
 
 ## Running it on the PC
 
@@ -408,6 +455,12 @@ once (`EDEN_NX2_KEY_RECORD` already records keys in `eden-cli`) and replayed aft
        --call '{"method":"reject_shaders","params":{"hashes":["3ddfb1d7621c4755"]}}'
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
        --call '{"method":"input_sequence","params":{"steps":[{"right_stick":[1,0],"frames":60},{"frames":30}]}}'
+   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
+       --call '{"method":"input_record","params":{"action":"start"}}'
+   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
+       --call '{"method":"input_record","params":{"action":"stop","path":"walk.json"}}'
+   $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
+       --call '{"method":"input_replay","params":{"path":"walk.json"}}'
    ```
 
    The request is `{"method": <tool>, "params": {...}}`, the same format the socket uses. Adapter-only

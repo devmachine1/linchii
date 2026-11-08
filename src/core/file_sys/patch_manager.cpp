@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <span>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -46,11 +48,17 @@ constexpr std::array<const char*, 14> EXEFS_FILE_NAMES{
     "subsdk3", "subsdk4",   "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
 };
 
+/// Bytes a built-in patch writes at an offset into the module's code (after the NSO header; an
+/// exefs IPS patch's offset is 0x100 more). With `original`, the module must hold those bytes
+/// there; with `checked`, it must hold `original_word`; `executable_padding` marks a code cave
+/// that must be untouched padding.
 struct BuiltinPatchRecord {
     size_t module_offset;
     std::span<const u8> bytes;
     std::span<const u8> original;
     bool executable_padding = false;
+    bool checked = false;
+    u32 original_word = 0;
 };
 
 struct BuiltinPatch {
@@ -61,6 +69,9 @@ struct BuiltinPatch {
     std::span<const BuiltinPatchRecord> records;
     size_t state_offset = 0;
     size_t state_size = 0;
+    /// When set, the patch applies only while this environment variable is 1 (A/B before it
+    /// becomes a default).
+    const char* enable_env = nullptr;
 };
 
 constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
@@ -85,12 +96,26 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
 };
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
-    BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+    BuiltinPatchRecord{.module_offset = 0x3C46200,
+                       .bytes = DYNAMIC_FPS_ROUTINE,
+                       .executable_padding = true},
+};
+
+// Occlusion Off (cLohan's community patch, from zortos293/Lichii#641): the game creates no
+// z-prepass occlusion queries and no samples-passed queries (ldrb w8, [x0] -> mov w8, wzr), so it
+// issues no occlusion reports and no conditional renders; every candidate object is drawn.
+constexpr std::array<u8, 4> MOV_W8_WZR{0xE8, 0x03, 0x1F, 0x2A};
+constexpr u32 LDRB_W8_X0 = 0x39400008;
+constexpr std::array OCCLUSION_OFF_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x11ACE68, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B828C, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82A4, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11ACEC8, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82DC, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
+    BuiltinPatchRecord{.module_offset = 0x11B82F4, .bytes = MOV_W8_WZR, .checked = true, .original_word = LDRB_W8_X0},
 };
 
 constexpr std::array BUILTIN_PATCHES{
-    // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
-    // instead of following the GPU-time controller down to its 480p floor.
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -106,6 +131,14 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
+    },
+    BuiltinPatch{
+        .name = "Occlusion Off (built-in, EDEN_NX2_OCCLUSION_OFF=1)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = OCCLUSION_OFF_RECORDS,
+        .enable_env = "EDEN_NX2_OCCLUSION_OFF",
     },
 };
 
@@ -529,6 +562,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
+        if (patch.enable_env != nullptr) {
+            const char* const value = std::getenv(patch.enable_env);
+            if (value == nullptr || std::string_view{value} != "1") {
+                continue;
+            }
+        }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
@@ -565,17 +604,37 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                 continue;
             }
         }
+        // Every record must fit and hold its original bytes, and none may have been patched by a
+        // user mod already (the mod's patch is used then, for all records).
         bool apply = true;
-        for (const auto& record : patch.records) {
-            if (!fits(nso, record.module_offset, record.bytes.size()) ||
-                !fits(out, record.module_offset, record.bytes.size()) ||
-                !fits(nso, record.module_offset, record.original.size())) {
+        for (const BuiltinPatchRecord& record : patch.records) {
+            const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
+            if (nso.size() < offset + record.bytes.size() ||
+                out.size() < offset + record.bytes.size()) {
                 LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} is past the module's end",
                             patch.name, name, record.module_offset);
                 apply = false;
                 break;
             }
-            const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
+            if (!record.original.empty() &&
+                !std::equal(record.original.begin(), record.original.end(), nso.begin() + offset)) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} does not hold its original",
+                            patch.name, name, record.module_offset);
+                apply = false;
+                break;
+            }
+            if (record.checked) {
+                u32 original;
+                std::memcpy(&original, nso.data() + offset, sizeof(original));
+                if (original != record.original_word) {
+                    LOG_WARNING(Loader,
+                                "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, expected {:#010x}",
+                                patch.name, name, record.module_offset, original,
+                                record.original_word);
+                    apply = false;
+                    break;
+                }
+            }
             if (record.executable_padding) {
                 const auto& text = header.segments[0];
                 const u64 text_end = u64{text.location} + text.size;
@@ -585,22 +644,18 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                     record.module_offset + record.bytes.size() > header.segments[1].location ||
                     !std::all_of(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
                                  [](u8 byte) { return byte == 0; })) {
-                    LOG_WARNING(Loader,
-                                "    - Skipping \"{}\": code cave is not executable padding",
+                    LOG_WARNING(Loader, "    - Skipping \"{}\": code cave is not executable padding",
                                 patch.name);
                     apply = false;
                     break;
                 }
             }
-            if (!std::equal(record.original.begin(), record.original.end(), nso.begin() + offset)) {
-                LOG_WARNING(Loader, "    - Skipping \"{}\": unexpected original bytes at {}+{:#x}",
-                            patch.name, name, record.module_offset);
-                apply = false;
-                break;
-            }
-            if (!std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
+            if (!std::equal(record.bytes.begin(), record.bytes.end(), nso.begin() + offset) &&
+                !std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
                             out.begin() + offset)) {
-                LOG_INFO(Loader, "    - Skipping \"{}\": a user mod already patched {}+{:#x}",
+                LOG_INFO(Loader,
+                         "    - Skipping \"{}\": a user mod already patched {}+{:#x}, the mod's "
+                         "patch is used",
                          patch.name, name, record.module_offset);
                 apply = false;
                 break;
@@ -609,7 +664,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!apply) {
             continue;
         }
-        for (const auto& record : patch.records) {
+        for (const BuiltinPatchRecord& record : patch.records) {
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
                         record.bytes.data(), record.bytes.size());
         }
@@ -1169,7 +1224,10 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id) {
+        if (patch.title_id != title_id ||
+            (patch.enable_env != nullptr &&
+             std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
+                 "1")) {
             continue;
         }
         const auto patch_disabled =

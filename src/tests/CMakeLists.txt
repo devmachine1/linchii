@@ -10,7 +10,6 @@ add_executable(tests
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
-    video_core/frame_dump_schedule.cpp
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
@@ -45,8 +44,10 @@ add_executable(tests
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
     input_common/calibration_lifetime.cpp
+    input_common/tas_input.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
+    video_core/oot_visual_workaround.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
@@ -66,6 +67,9 @@ add_executable(tests
     video_core/async_draw_policy.cpp
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp
+    video_core/oot_network.cpp
+    video_core/page_filter.cpp
+    video_core/pipeline_cache_policy.cpp
     video_core/pipeline_eviction_policy.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
@@ -81,6 +85,7 @@ add_executable(tests
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
+    video_core/split_write_tracker.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
@@ -118,6 +123,7 @@ add_executable(tests
     common/event.cpp
     common/fibers.cpp
     common/fs_iterate.cpp
+    common/frizti_settings.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/host_memory_failure.cpp
@@ -130,6 +136,7 @@ add_executable(tests
     common/scratch_buffer.cpp
     common/slot_vector.cpp
     common/sparse_large_vector.cpp
+    common/thread_pinning.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp

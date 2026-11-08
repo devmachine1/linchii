@@ -51,9 +51,9 @@ Check these before filing a new one.
 ## Settings for AMD users
 
 - Keep the split GPU thread on (`EDEN_NX2_SPLIT=2`, the default in `nx2_switches.txt`) and GPU
-  accuracy below High, which turns the split off. One open report has textures flickering in that
-  setup on an RX 9070 XT ([#163]); High accuracy fixed the flicker there but cost most of the frame
-  rate, because it turns the split off.
+  accuracy below High, which turns the split off. One open report had textures flickering in that
+  setup on an RX 9070 XT ([#163]); High accuracy fixed it there but cost most of the frame rate,
+  because it turns the split off. [#425] fixed the flicker with the split left on.
 - Logging at `*:Info` costs CPU time in busy scenes. Use `*:Error` when you compare frame rates
   ([#403]).
 - The first run compiles every shader and can stall for minutes; later runs load the pipeline
@@ -74,7 +74,7 @@ Check these before filing a new one.
    AMD and NVIDIA differ.
 4. Check the bindings as well as the shader. Reads past the end of a buffer bound too small return
    zeros or other values from inside the buffer under robust buffer access, so a plausible value
-   doesn't prove the binding is large enough. Ocarina's fog read zeros this way ([#292]).
+   doesn't prove the binding is large enough. Ocarina's fog read zeros this way ([#351]).
 5. If you can, compare with an NVIDIA run. A difference that also shows up there is an emulation
    bug, not an AMD one.
 
@@ -96,4 +96,5 @@ Check these before filing a new one.
 [#378]: https://github.com/zortos293/Lichii/pull/378
 [#392]: https://github.com/zortos293/Lichii/issues/392
 [#403]: https://github.com/zortos293/Lichii/issues/403
+[#425]: https://github.com/zortos293/Lichii/pull/425
 [#432]: https://github.com/zortos293/Lichii/pull/432

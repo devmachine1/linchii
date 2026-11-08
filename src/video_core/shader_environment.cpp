@@ -313,6 +313,8 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
+    // A trap guard is checked against live constants on every dispatch (ComputeShader), so a
+    // cached pipeline is only used once its guard passes (zortos293/Lichii#192, SinCuri0).
     return !has_unbound_instructions;
 }
 
@@ -391,6 +393,7 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
                        sizeof(gp_passthrough_mask));
         }
         if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            // Task and mesh programs are translated with these (none were stored before).
             file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
                 .write(reinterpret_cast<const char*>(&mesh_primitive_header),
                        sizeof(mesh_primitive_header));
@@ -436,9 +439,29 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
     const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
                                                        gpu_memory->UsesNativeTiling())};
-    ASSERT(index <= tic_limit);
-    const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
+    if (index > tic_limit) {
+        // Past the pool, the bytes are not a descriptor: reading them gave the shader a random
+        // texture type and format (garbage-format asserts, then crashes and device losses on AMD
+        // in Ocarina of Time). At draw time the texture cache binds the null view for such an
+        // index (VisitImageView), so compile for what that view is: a plain 2D RGBA8 texture.
+        static std::atomic<u32> warnings{};
+        if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(HW_GPU, "Texture handle {:#x} indexes past the descriptor pool "
+                                "(index {} > limit {}); using a null 2D texture",
+                        raw, index, tic_limit);
+        }
+        entry.raw.fill(0);
+        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
+        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
+        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
+        entry.normalized_coords.Assign(1);
+        return entry;
+    }
+    const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
@@ -1207,7 +1230,8 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
-        throw Shader::LogicError("Uncached storage pointer classification");
+        throw Shader::LogicError("Uncached storage pointer classification c{}[{:#x}]", index,
+                                 offset);
     }
     return it->second != 0;
 }
@@ -1215,7 +1239,8 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
-        throw Shader::LogicError("Uncached storage pointer table classification");
+        throw Shader::LogicError("Uncached storage pointer table classification c{}[{:#x}]+{:#x}",
+                                 index, offset, indirect);
     }
     return it->second != 0;
 }

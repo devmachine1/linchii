@@ -93,6 +93,10 @@ public:
     void PreCopyBarrier();
     void PostCopyBarrier();
     void Finish();
+    /// OpenGL finishes synchronously: no separate host-read barrier is needed.
+    void FinishForHostRead() {
+        Finish();
+    }
 
     void TickFrame(Common::SlotVector<Buffer>&) noexcept {}
 

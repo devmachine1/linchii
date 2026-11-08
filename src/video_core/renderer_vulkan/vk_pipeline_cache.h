@@ -143,8 +143,42 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
-    /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
-    /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
+    /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
+    /// bound programs read (see VideoCommon::KeyedAttributeTypes).
+    void RefreshGraphicsKey();
+
+    /// EDEN_NX2_PIPELINE_CLEAN / EDEN_NX2_EXP19: CurrentGraphicsPipeline without
+    /// FixedPipelineState::Refresh nor the key comparison while nothing Refresh reads changed
+    /// since the last lookup. `patch`: EXP19=2.
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineClean(bool patch);
+    /// The registers Refresh reads with these features, as (first word, words) ranges.
+    void BuildCleanWatch(bool patch);
+    [[nodiscard]] bool CleanInputsUnchanged() const;
+    void TakeCleanSnapshot();
+
+    struct CleanLookup {
+        struct Range {
+            u32 first;
+            u32 count;
+        };
+        bool built{};
+        bool patch{};                  ///< Built for CurrentGraphicsPipelineClean(true)
+        std::vector<Range> ranges;     ///< Read by every Refresh
+        std::vector<Range> xfb_ranges; ///< Read while transform feedback is enabled
+        std::vector<u32> snapshot;     ///< ranges' words at the last Refresh
+        std::vector<u32> xfb_snapshot;
+        std::array<u64, 6> hashes{};   ///< graphics_key.unique_hashes at the last Refresh
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        Maxwell::PrimitiveTopology topology{};
+        Tegra::Engines::Maxwell3D::EngineHint engine_state{};
+        /// current_pipeline when its key was graphics_key after the last Refresh, else null.
+        GraphicsPipeline* pipeline{};
+        u64 hits{};
+        u64 patches{};
+        u64 misses{};
+        std::chrono::steady_clock::time_point last_log{};
+    } clean;
+
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
@@ -154,6 +188,13 @@ private:
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+
+    /// Builds a disk-cached graphics pipeline from the first of its records (newest first) that
+    /// loads. When none does, the GPU thread's build of it is stored again.
+    std::unique_ptr<GraphicsPipeline> CreateCachedGraphicsPipeline(
+        const GraphicsPipelineCacheKey& key,
+        std::vector<std::vector<VideoCommon::FileEnvironment>>& records,
+        PipelineStatistics* statistics);
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
@@ -188,10 +229,13 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    bool oot_visual_workaround{};
+    u64 visual_workaround_title{};
     const size_t num_pipeline_workers;
     EmissionBudget emission_budget;
 
     GraphicsPipelineCacheKey graphics_key{};
+    u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
     GraphicsPipeline* current_pipeline{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
@@ -223,6 +267,11 @@ private:
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
     /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
     std::unordered_set<u64> disk_pipelines;
+    /// Key hashes of disk-cached graphics pipelines none of whose records loaded (one written
+    /// before a translator change can ask about slots it never classified): stored again when the
+    /// GPU thread builds them.
+    std::unordered_set<u64> failed_disk_pipelines;
+    std::mutex failed_disk_pipelines_mutex;
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
