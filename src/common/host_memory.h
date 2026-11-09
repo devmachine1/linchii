@@ -123,6 +123,10 @@ public:
         return virtual_size;
     }
 
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
+
     bool IsInVirtualRange(void* address) const noexcept {
         return address >= virtual_base && address < virtual_base + virtual_size;
     }
@@ -130,6 +134,8 @@ public:
 private:
     size_t backing_size{};
     size_t virtual_size{};
+    /// The backing is a shared mapping of a tmpfs file (memfd), not private anonymous memory.
+    bool backing_shared{};
 
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     // Low level handler for the platform dependent memory routines

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/memory_detect.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
@@ -74,6 +75,7 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -1483,20 +1485,37 @@ private:
     }};
     // EDEN_NX2_TRIM_ZERO=<seconds>: that often, resident guest pages holding only zeros leave the
     // working set (Common::HostMemory::TrimZeroPages). Ocarina boots with ~7 GB of them.
+    // Unset: automatic when the host cannot hold the guest memory twice over (a 13-16 GiB machine
+    // running an 8 GiB title: guest zeros alone left under 1.5 GiB free and the OOM killer ended
+    // the emulator right after the intro); EDEN_NX2_TRIM_ZERO=0 keeps it off.
     std::jthread m_zero_trim_thread{[this](std::stop_token stop) {
         const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
-        const int interval = value != nullptr ? std::atoi(value) : 0;
+        int interval = value != nullptr ? std::atoi(value) : -1;
+        auto& buffer = system.DeviceMemory().buffer;
+        if (interval < 0) {
+            const u64 guest = buffer.BackingSize();
+            const u64 host = Common::GetMemInfo().TotalPhysicalMemory;
+            interval = guest != 0 && host != 0 && host < guest * 2 ? 5 : 0;
+            if (interval != 0) {
+                LOG_INFO(Service,
+                         "ZERO TRIM: automatic, {} MiB of guest memory on a {} MiB host",
+                         guest >> 20, host >> 20);
+            }
+        }
         if (interval <= 0) {
             return;
         }
         Common::SetCurrentThreadName("nx2:ZeroTrim");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         // After the boot (first 2 minutes) almost nothing new is found, and each pass reads all of
-        // the resident guest memory: then only every EDEN_NX2_TRIM_ZERO_LATER seconds (default 60).
+        // the resident guest memory: then only every EDEN_NX2_TRIM_ZERO_LATER seconds (default 60,
+        // or 10 when this was turned on automatically for a tight host, where staying inside RAM
+        // matters more than the pass's CPU time).
         const char* later_value = std::getenv("EDEN_NX2_TRIM_ZERO_LATER");
-        const int later = later_value != nullptr ? std::atoi(later_value) : 60;
+        const bool automatic = value == nullptr;
+        const int later =
+            later_value != nullptr ? std::atoi(later_value) : (automatic ? 10 : 60);
         const auto boot = std::chrono::steady_clock::now();
-        auto& buffer = system.DeviceMemory().buffer;
         while (!stop.stop_requested()) {
             const bool booting = std::chrono::steady_clock::now() - boot < std::chrono::minutes{2};
             const int wait = booting ? interval : later;
@@ -2805,6 +2824,7 @@ private:
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+    static constexpr u32 MaxDroppedInARow = 30; // see DropOvertakenFrames
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2887,6 +2907,8 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            m_clock.Reset();
+            m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -3010,7 +3032,22 @@ private:
         const auto input_size = input.data.size();
         {
             std::scoped_lock lk{m_mutex};
-            m_inputs.Push(std::move(input));
+            // The SDK answers busy when the decoder cannot take a packet, and the client retries
+            // after the submission-ready event. Taking every packet let a player queue a whole
+            // movie: Ocarina of Time's title movie went in at ~330 packets a second (2,600
+            // queued), and until the last was in, its pictures came at 20-28 fps, so the video
+            // started ~11 s behind its audio. End of stream is never refused.
+            if (!m_inputs.Submit(std::move(input))) {
+                if (Nx2VideoTraceEnabled()) {
+                    LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
+                             m_syncpoint, pts, m_inputs.Size());
+                }
+                // nn::codec's module (111) is HwOpus in ErrorModule
+                constexpr Result ResultDecoderBusy{ErrorModule::HwOpus, 3603};
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.PushRaw<u32>(ResultDecoderBusy.raw);
+                return;
+            }
             m_stream_ended = false;
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
@@ -3048,6 +3085,8 @@ private:
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
+            m_clock.Reset();
+            m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
@@ -3072,8 +3111,48 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
+            m_clock.Reset();
+            m_stream_start.reset();
         }
         TipcReplyWords(ctx, {});
+    }
+
+    s64 HostTimeUs() const {
+        return system.CoreTiming().GetGlobalTimeUs().count();
+    }
+
+    // When emulation last resumed from a pause: the movie's audio stopped meanwhile.
+    s64 PauseEndUs() const {
+        return system.CoreTiming().GetPauseEndTime().count() / 1000;
+    }
+
+    // Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
+    // one, while the movie's audio plays in real time: below the movie's frame rate the picture
+    // falls further behind the sound. Drop decoded frames a later frame has already overtaken
+    // (m_mutex held). Returns true when the only frame left is late and more input is queued:
+    // decode on before filling an image.
+    bool DropOvertakenFrames() {
+        if (m_decoded.empty()) {
+            return false;
+        }
+        const auto due = m_clock.Due(HostTimeUs(), PauseEndUs());
+        if (!due) {
+            m_dropped_in_a_row = 0;
+            return false;
+        }
+        while (m_decoded.size() >= 2 && m_dropped_in_a_row < MaxDroppedInARow) {
+            const Decoded& front = m_decoded[0];
+            const Decoded& next = m_decoded[1];
+            if (front.end || !front.picture || next.pts <= front.pts || next.pts > *due) {
+                break;
+            }
+            m_decoded.pop_front();
+            ++m_frames_dropped;
+            ++m_dropped_in_a_row;
+        }
+        const Decoded& front = m_decoded.front();
+        return m_decoded.size() == 1 && !m_inputs.Empty() && !front.end &&
+               m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -3102,6 +3181,7 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                m_clock.Acquired(HostTimeUs(), output->pts, PauseEndUs());
             }
         }
         if (!output) {
@@ -3145,6 +3225,8 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                m_last_decoded_pts = 0;
+                m_dropped_in_a_row = 0;
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -3152,7 +3234,8 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty()) {
+            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
+                m_dropped_in_a_row = 0;
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
                 const u32 image = m_free.front();
@@ -3182,10 +3265,24 @@ private:
                     DrainFreeAsEndOfStream();
                 }
                 ++m_frames_out;
+                const s64 written_us = HostTimeUs();
+                if (!m_stream_start) {
+                    m_stream_start = {written_us, frame.pts};
+                }
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
-                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
+                    // How far the frames written lag their timestamps since the stream's first.
+                    const s64 behind_us =
+                        (written_us - m_stream_start->first) -
+                        (static_cast<s64>(frame.pts) - static_cast<s64>(m_stream_start->second));
+                    LOG_INFO(Service,
+                             "{} frame {} ({}x{}, pts {} us{}) in image {}, {} late dropped, "
+                             "{} ms behind",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
-                             frame.end ? ", end of stream" : "", image);
+                             frame.end ? ", end of stream" : "", image, m_frames_dropped,
+                             behind_us / 1000);
+                }
+                if (frame.end) {
+                    m_stream_start.reset();
                 }
                 continue;
             }
@@ -3231,6 +3328,10 @@ private:
             }
             for (auto& picture : pictures) {
                 const u64 pts = picture.pts;
+                if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
+                    m_frame_interval = pts - m_last_decoded_pts;
+                }
+                m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
             }
             if (input.end) {
@@ -3420,6 +3521,12 @@ private:
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
     u64 m_decoded_frames{};
+    u64 m_frames_dropped{};
+    Nx2MovieClock m_clock;
+    u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
+    u64 m_last_decoded_pts{};
+    u32 m_dropped_in_a_row{};
+    std::optional<std::pair<s64, u64>> m_stream_start; ///< Host time (us) and pts of its first frame
     Nx2VideoInputQueue m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
