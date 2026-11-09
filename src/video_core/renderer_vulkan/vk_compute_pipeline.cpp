@@ -317,8 +317,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         try {
             const std::array<u64, 1> traced{shader_hash};
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
-            const PipelineBuildTrace trace{"compute", shader_hash, traced, unoptimized};
+            PipelineBuildTrace trace{"compute", shader_hash, traced, unoptimized};
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            trace.End();
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());

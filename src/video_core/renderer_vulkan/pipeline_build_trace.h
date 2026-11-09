@@ -57,6 +57,14 @@ public:
         TracePipelineBuild("BEGIN", kind_, key_hash_, stage_hashes_, unoptimized_);
     }
     ~PipelineBuildTrace() {
+        End();
+    }
+    /// Writes the END line now; the destructor does it too when this is not called.
+    void End() {
+        if (ended_) {
+            return;
+        }
+        ended_ = true;
         TracePipelineBuild("END", kind_, key_hash_, stage_hashes_, unoptimized_,
                            std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - begin_)
@@ -70,6 +78,7 @@ private:
     u64 key_hash_;
     std::span<const u64> stage_hashes_;
     bool unoptimized_;
+    bool ended_{};
     std::chrono::steady_clock::time_point begin_;
 };
 

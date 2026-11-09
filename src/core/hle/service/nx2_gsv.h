@@ -2038,8 +2038,6 @@ private:
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
-            return;
-        }
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service,
                      "nx2:vi2 present #{} swap interval {} at {} Hz, FPS limit {} (word 12 = {:#x})",

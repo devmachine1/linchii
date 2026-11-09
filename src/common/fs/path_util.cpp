@@ -314,9 +314,8 @@ void CreateEdenPaths() {
     PathManagerImpl::GetInstance().CreateEdenPaths();
 }
 
-#ifdef _WIN32
-
 fs::path GetExeDirectory() {
+#ifdef _WIN32
     wchar_t exe_path[MAX_PATH];
 
     if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) == 0) {
@@ -325,7 +324,22 @@ fs::path GetExeDirectory() {
     }
 
     return fs::path{exe_path}.parent_path();
+#elif defined(__linux__)
+    std::error_code error;
+    const auto exe = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error) {
+        LOG_ERROR(Common_Filesystem, "Failed to get the path to the executable of the current "
+                                     "process: {}", error.message());
+        return {};
+    }
+    return exe.parent_path();
+#else
+    // (the callers that need it are Windows and Linux; elsewhere there is no recipe folder)
+    return {};
+#endif
 }
+
+#ifdef _WIN32
 
 fs::path GetAppDataRoamingDirectory() {
     PWSTR appdata_roaming_path = nullptr;

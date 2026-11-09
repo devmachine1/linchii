@@ -1084,7 +1084,8 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          : VideoCommon::PipelineMergeLog{};
     bool log_changed = false;
     std::optional<VideoCommon::PipelineKeySet> own_keys;
-    using Status = VideoCommon::PipelineCacheMergeResult::Status;
+    // decltype: Xlib.h, reached through Qt on Linux, defines Status as a macro.
+    using MergeStatus = decltype(VideoCommon::PipelineCacheMergeResult::status);
     for (const Candidate& candidate : candidates) {
         const auto stamp = VideoCommon::StampPipelineCacheFile(candidate.cache);
         if (!stamp) {
@@ -1112,7 +1113,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                 candidate.cache, own_cache, PipelineCacheMagic, *version, CACHE_VERSION,
                 ReadPipelineRecordKey, own_keys);
             switch (result.status) {
-            case Status::Merged:
+            case MergeStatus::Merged:
                 LOG_INFO(Render_Vulkan,
                          "Merged {} new pipelines ({} records) from {} (cache version {}); {} "
                          "were already cached",
@@ -1120,25 +1121,25 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          result.known_pipelines);
                 cache_merged = true;
                 break;
-            case Status::Missing:
+            case MergeStatus::Missing:
                 continue;
-            case Status::WrongHeader:
+            case MergeStatus::WrongHeader:
                 LOG_WARNING(Render_Vulkan,
                             "Skipped pipeline cache {}: it is not a cache version {} file", path,
                             *version);
                 break;
-            case Status::BadSource:
+            case MergeStatus::BadSource:
                 LOG_WARNING(Render_Vulkan,
                             "Skipped pipeline cache {} (cache version {}): {}; nothing was "
                             "merged, it is tried again when it changes",
                             path, *version, result.detail);
                 break;
-            case Status::BadDestination:
+            case MergeStatus::BadDestination:
                 LOG_WARNING(Render_Vulkan, "Not merging pipeline cache {} into {}: {}", path,
                             Common::FS::PathToUTF8String(own_cache), result.detail);
                 return;
-            case Status::NoSpace:
-            case Status::WriteFailed:
+            case MergeStatus::NoSpace:
+            case MergeStatus::WriteFailed:
                 LOG_WARNING(Render_Vulkan,
                             "Not merging pipeline cache {}: {}; the cache is unchanged", path,
                             result.detail);
@@ -3952,14 +3953,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     .read(reinterpret_cast<char*>(&pad), 2)
                     .read(reinterpret_cast<char*>(ids.data()), count * sizeof(u32));
                 const bool compute = kind == 1;
-                ComputePipelineCacheKey compute_key{};
-                GraphicsPipelineCacheKey graphics_key{};
+                ComputePipelineCacheKey record_compute_key{};
+                GraphicsPipelineCacheKey record_graphics_key{};
                 if (compute) {
-                    in.read(reinterpret_cast<char*>(&compute_key), sizeof(compute_key));
+                    in.read(reinterpret_cast<char*>(&record_compute_key), sizeof(record_compute_key));
                 } else {
-                    in.read(reinterpret_cast<char*>(&graphics_key), sizeof(graphics_key));
-                    RecordedKeyForThisDevice(graphics_key);
-                    const auto& key_state = graphics_key.state;
+                    in.read(reinterpret_cast<char*>(&record_graphics_key), sizeof(record_graphics_key));
+                    RecordedKeyForThisDevice(record_graphics_key);
+                    const auto& key_state = record_graphics_key.state;
                     const bool other_device =
                         (key_state.extended_dynamic_state != 0) !=
                             dynamic_features.has_extended_dynamic_state ||
@@ -4008,7 +4009,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             }
                         }
                         skipped = true;
-                    } else if (!keeping && disk_keys && disk_keys->contains(graphics_key.Hash())) {
+                    } else if (!keeping && disk_keys && disk_keys->contains(record_graphics_key.Hash())) {
                         ++state.known;
                         skipped = true;
                     }
@@ -4030,7 +4031,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     const std::span<const u32> env_ids{ids.data(), count};
                     if (compute) {
                         ComputeKeep kept;
-                        ok = CreateComputePipeline(pools, compute_key, envs.front(), nullptr,
+                        ok = CreateComputePipeline(pools, record_compute_key, envs.front(), nullptr,
                                                    false, true, keeping ? &kept : nullptr)
                                  .pipeline != nullptr;
                         if (ok && keeping && !kept.spirv.empty()) {
@@ -4038,7 +4039,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             std::array<std::vector<u32>, 5> spirv;
                             infos[0] = std::move(kept.info);
                             spirv[0] = std::move(kept.spirv);
-                            writer.Keep(index, 1, 0, compute_key.Hash(), env_ids, infos, spirv);
+                            writer.Keep(index, 1, 0, record_compute_key.Hash(), env_ids, infos, spirv);
                         }
                     } else {
                         boost::container::static_vector<Shader::Environment*,
@@ -4052,7 +4053,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         TranslationRecord kept;
                         kept.keep_infos = true;
                         const auto pipeline{CreateGraphicsPipeline(
-                            pools, graphics_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
+                            pools, record_graphics_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
                             nullptr, false, keeping ? &kept : nullptr)};
                         ok = pipeline && !pipeline->Failed();
                         // A pipeline drawn through the task/mesh compute fallback is not kept:
@@ -4062,7 +4063,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         if (ok && keeping && kept.complete && !kept.mesh_emulated) {
                             writer.Keep(index, 0,
                                         kept.libraries ? PrecompiledKept::FlagLibraries : u8{0},
-                                        graphics_key.Hash(), env_ids, kept.infos, kept.spirv);
+                                        record_graphics_key.Hash(), env_ids, kept.infos, kept.spirv);
                         }
                     }
                 }
@@ -4418,25 +4419,25 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
             return "its precompiled record (other environments)";
         }
         const u64 key_offset = offset + 4 + count * sizeof(u32);
-        ComputePipelineCacheKey compute_key{};
-        GraphicsPipelineCacheKey graphics_key{};
+        ComputePipelineCacheKey record_compute_key{};
+        GraphicsPipelineCacheKey record_graphics_key{};
         if (compute) {
             if (!index.ReadPrecompiled(key_offset,
-                                       std::span(reinterpret_cast<u8*>(&compute_key),
-                                                 sizeof(compute_key)))) {
+                                       std::span(reinterpret_cast<u8*>(&record_compute_key),
+                                                 sizeof(record_compute_key)))) {
                 return "its precompiled record (unreadable)";
             }
-            if (compute_key.Hash() != record.key_hash) {
+            if (record_compute_key.Hash() != record.key_hash) {
                 return "the key";
             }
         } else {
             if (!index.ReadPrecompiled(key_offset,
-                                       std::span(reinterpret_cast<u8*>(&graphics_key),
-                                                 sizeof(graphics_key)))) {
+                                       std::span(reinterpret_cast<u8*>(&record_graphics_key),
+                                                 sizeof(record_graphics_key)))) {
                 return "its precompiled record (unreadable)";
             }
-            RecordedKeyForThisDevice(graphics_key);
-            if (graphics_key.Hash() != record.key_hash) {
+            RecordedKeyForThisDevice(record_graphics_key);
+            if (record_graphics_key.Hash() != record.key_hash) {
                 return "the key (as this device and EDEN_NX2_CANONICAL_KEYS key it)";
             }
         }
@@ -4464,7 +4465,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 ComputeKeep keep;
                 keep.translate_only = true;
                 [[maybe_unused]] const auto none = CreateComputePipeline(
-                    pools, compute_key, envs.front(), nullptr, false, true, &keep);
+                    pools, record_compute_key, envs.front(), nullptr, false, true, &keep);
                 spirv[0] = std::move(keep.spirv);
                 infos[0] = std::move(keep.info);
             } else {

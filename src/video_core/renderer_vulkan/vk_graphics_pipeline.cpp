@@ -2347,7 +2347,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     }
 
     const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
-    const PipelineBuildTrace trace{"graphics", key.Hash(), key.unique_hashes, unoptimized};
+    PipelineBuildTrace trace{"graphics", key.Hash(), key.unique_hashes, unoptimized};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -2373,6 +2373,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    trace.End();
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {
@@ -2549,7 +2550,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             pre_rasterization ? VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT
                               : VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT),
     };
-    const PipelineBuildTrace trace{pre_rasterization ? "graphics-gpl-prerasterization"
+    PipelineBuildTrace trace{pre_rasterization ? "graphics-gpl-prerasterization"
                                                      : "graphics-gpl-fragment",
                                    key.Hash(), key.unique_hashes, false};
     library.pipeline = device.GetLogical().CreateGraphicsPipeline({
@@ -2574,6 +2575,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    trace.End();
     return library;
 }
 
@@ -2598,7 +2600,7 @@ vk::Pipeline GraphicsPipeline::LinkLibraries(VkRenderPass render_pass, bool opti
         flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
     }
     const auto begin = std::chrono::steady_clock::now();
-    const PipelineBuildTrace trace{"graphics-gpl-linked", key.Hash(), key.unique_hashes,
+    PipelineBuildTrace trace{"graphics-gpl-linked", key.Hash(), key.unique_hashes,
                                    (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0};
     vk::Pipeline linked_pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -2621,6 +2623,7 @@ vk::Pipeline GraphicsPipeline::LinkLibraries(VkRenderPass render_pass, bool opti
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    trace.End();
     library_cache->RecordLink(optimized, std::chrono::steady_clock::now() - begin);
     return linked_pipeline;
 }
@@ -2661,7 +2664,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .pNext = nullptr,
         .flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
     };
-    const PipelineBuildTrace vertex_input_trace{"graphics-gpl-vertex-input", key.Hash(),
+    PipelineBuildTrace vertex_input_trace{"graphics-gpl-vertex-input", key.Hash(),
                                                 key.unique_hashes, false};
     vertex_input_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -2684,12 +2687,13 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    vertex_input_trace.End();
     const VkGraphicsPipelineLibraryCreateInfoEXT fragment_output_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
         .pNext = nullptr,
         .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
     };
-    const PipelineBuildTrace fragment_output_trace{"graphics-gpl-fragment-output", key.Hash(),
+    PipelineBuildTrace fragment_output_trace{"graphics-gpl-fragment-output", key.Hash(),
                                                    key.unique_hashes, false};
     fragment_output_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -2712,6 +2716,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    fragment_output_trace.End();
     pipeline =
         LinkLibraries(render_pass, GplOptimizeEnabled() || !device.CanFastLinkGraphicsLibraries());
     linked = true;
