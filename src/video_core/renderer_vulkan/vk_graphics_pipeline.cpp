@@ -22,6 +22,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -2345,6 +2346,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
+    const PipelineBuildTrace trace{"graphics", key.Hash(), key.unique_hashes, unoptimized};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -2546,6 +2549,9 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             pre_rasterization ? VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT
                               : VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT),
     };
+    const PipelineBuildTrace trace{pre_rasterization ? "graphics-gpl-prerasterization"
+                                                     : "graphics-gpl-fragment",
+                                   key.Hash(), key.unique_hashes, false};
     library.pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &library_ci,
@@ -2592,6 +2598,8 @@ vk::Pipeline GraphicsPipeline::LinkLibraries(VkRenderPass render_pass, bool opti
         flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
     }
     const auto begin = std::chrono::steady_clock::now();
+    const PipelineBuildTrace trace{"graphics-gpl-linked", key.Hash(), key.unique_hashes,
+                                   (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0};
     vk::Pipeline linked_pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &link_ci,
@@ -2653,6 +2661,8 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .pNext = nullptr,
         .flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
     };
+    const PipelineBuildTrace vertex_input_trace{"graphics-gpl-vertex-input", key.Hash(),
+                                                key.unique_hashes, false};
     vertex_input_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &vertex_input_ci,
@@ -2679,6 +2689,8 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .pNext = nullptr,
         .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
     };
+    const PipelineBuildTrace fragment_output_trace{"graphics-gpl-fragment-output", key.Hash(),
+                                                   key.unique_hashes, false};
     fragment_output_library = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &fragment_output_ci,
