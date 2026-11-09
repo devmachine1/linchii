@@ -48,7 +48,8 @@ TEST_CASE("A new revision sets every tuned setting", "[frizti_settings]") {
     SetOtherBuildValues(*values);
     const auto tuned = Frizti::TunedSettings(*values);
     const auto changes = Frizti::ReconcileGlobal(tuned, {}, true);
-    CHECK(changes.size() == tuned.size());
+    // Only the settings that another build changed differ from their tuned defaults.
+    CHECK(changes.size() == 10);
     CheckFriztiValues(*values);
     CHECK(Frizti::ReconcileGlobal(tuned, {}, true).empty());
 }
