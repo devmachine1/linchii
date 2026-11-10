@@ -54,6 +54,7 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    SafeReadFlush,  ///< EDEN_NX2_SPLIT_SAFE_READS: a CPU-side read flushes back-owned caches
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     DispatchWait,   ///< EXP10: a macro memory read waits for the dispatches sent since it flushed
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
@@ -66,7 +67,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
+    "gp sync fence", "map",           "front start", "front verify",  "safe read flush",
+    "macro dma check",
     "macro dma dispatch", "fence writers", "qmd read", "list copy writers",
 };
 

@@ -126,7 +126,14 @@ public:
 
         if (this->TrySetSpan()) {
             if constexpr (FLAGS & GuestMemoryFlags::Safe && M::HAS_FLUSH_INVALIDATION) {
-                m_memory->FlushRegion(m_addr, this->size_bytes());
+                if constexpr (M::HAS_SPLIT_AWARE_FLUSH) {
+                    // QUEUED ON THE SPLIT'S BACK (EDEN_NX2_SPLIT_SAFE_READS): the caches belong
+                    // to the GPU split's back thread, so the flush runs there instead of the
+                    // front (or a guest thread) taking them.
+                    m_memory->FlushRegionForRead(m_addr, this->size_bytes());
+                } else {
+                    m_memory->FlushRegion(m_addr, this->size_bytes());
+                }
             }
         } else {
             if (backup) {
