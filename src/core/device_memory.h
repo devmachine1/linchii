@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <thread>
+
 #include "common/host_memory.h"
 #include "common/typed_address.h"
 
@@ -66,6 +68,18 @@ public:
     }
 
     Common::HostMemory buffer;
+
+private:
+    /// All-zero guest pages leave the working set: a hole in the backing on Linux, VirtualUnlock
+    /// on Windows. A pass comes every 5 s while they keep turning up, backing off to a minute.
+    void TrimZeroPages(std::stop_token stop);
+    std::jthread zero_trim_thread;
+#ifdef _WIN32
+    /// EDEN_NX2_MEM_OWNERS (on by default, =0 off): every 10 s, samples which guest pages are
+    /// resident and the process's heaps for the "Memory owners" log line.
+    void ProbeMemory(std::stop_token stop);
+    std::jthread memory_probe_thread;
+#endif
 };
 
 } // namespace Core

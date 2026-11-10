@@ -26,8 +26,9 @@
 #include <utility>
 #include <vector>
 
+#include "audio_core/common/common.h"
+#include "audio_core/sink/sink_stream.h"
 #include "common/alignment.h"
-#include "common/memory_detect.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
@@ -75,7 +76,6 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
-#include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -1483,67 +1483,50 @@ private:
             }
         }
     }};
-    // EDEN_NX2_TRIM_ZERO=<seconds>: that often, resident guest pages holding only zeros leave the
-    // working set (Common::HostMemory::TrimZeroPages). Ocarina boots with ~7 GB of them.
-    // Unset: automatic when the host cannot hold the guest memory twice over (a 13-16 GiB machine
-    // running an 8 GiB title: guest zeros alone left under 1.5 GiB free and the OOM killer ended
-    // the emulator right after the intro); EDEN_NX2_TRIM_ZERO=0 keeps it off.
-    std::jthread m_zero_trim_thread{[this](std::stop_token stop) {
-        const char* value = std::getenv("EDEN_NX2_TRIM_ZERO");
-        int interval = value != nullptr ? std::atoi(value) : -1;
-        auto& buffer = system.DeviceMemory().buffer;
-        if (interval < 0) {
-            const u64 guest = buffer.BackingSize();
-            const u64 host = Common::GetMemInfo().TotalPhysicalMemory;
-            interval = guest != 0 && host != 0 && host < guest * 2 ? 5 : 0;
-            if (interval != 0) {
-                LOG_INFO(Service,
-                         "ZERO TRIM: automatic, {} MiB of guest memory on a {} MiB host",
-                         guest >> 20, host >> 20);
-            }
-        }
-        if (interval <= 0) {
-            return;
-        }
-        Common::SetCurrentThreadName("nx2:ZeroTrim");
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-        // After the boot (first 2 minutes) almost nothing new is found, and each pass reads all of
-        // the resident guest memory: then only every EDEN_NX2_TRIM_ZERO_LATER seconds (default 60,
-        // or 10 when this was turned on automatically for a tight host, where staying inside RAM
-        // matters more than the pass's CPU time).
-        const char* later_value = std::getenv("EDEN_NX2_TRIM_ZERO_LATER");
-        const bool automatic = value == nullptr;
-        const int later =
-            later_value != nullptr ? std::atoi(later_value) : (automatic ? 10 : 60);
-        const auto boot = std::chrono::steady_clock::now();
-        while (!stop.stop_requested()) {
-            const bool booting = std::chrono::steady_clock::now() - boot < std::chrono::minutes{2};
-            const int wait = booting ? interval : later;
-            if (wait <= 0) {
-                return;
-            }
-            for (int i = 0; i < wait * 10 && !stop.stop_requested(); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{100});
-            }
-            if (stop.stop_requested()) {
-                break;
-            }
-            const auto start = std::chrono::steady_clock::now();
-            const auto [resident, trimmed] = buffer.TrimZeroPages();
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - start)
-                                .count();
-            LOG_INFO(Service,
-                     "ZERO TRIM: {} MiB of guest memory resident, {} MiB of all-zero pages trimmed "
-                     "in {} ms; kernel zero-filled {} MiB so far",
-                     resident >> 20, trimmed >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20);
-        }
-    }};
 };
 
 inline bool Nx2VideoTraceEnabled() {
     static const bool enabled = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
     return enabled;
+}
+
+// EDEN_NX2_VIDEO_TRACE=1: once a second while a movie plays, one Info line ("nx2 video sync") on
+// how far its frames run behind the wall clock and the audio, and where the decode thread's time
+// goes. Cheap: a few clock reads per frame.
+inline bool Nx2VideoSyncTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_VIDEO_TRACE");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_VIDEO_PTS_SYNC (on unless 0): movies follow their timestamps. When an output image
+// comes free, the decode thread writes the newest decoded frame that is due by the playback clock
+// (the audio the host device played since the movie's first frame; the wall clock when no audio
+// is counted) and drops the older ones, so a game that takes one movie frame per game frame
+// (Ocarina of Time: a 60 fps movie in a 30 fps loop) no longer plays it slower than its audio.
+// A frame not yet due waits (at most 250 ms), so a game that buffers ahead gets no duplicates.
+inline bool Nx2VideoPtsSyncEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_VIDEO_PTS_SYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_VIDEO_RELEASE_WAIT_MS (experiment, default 100): the longest the decode thread waits
+// for the game's GPU reads of an output image it gave back before writing the next frame into
+// it. 0 writes at once: the game can then show a frame early.
+inline std::chrono::milliseconds Nx2VideoReleaseWaitLimit() {
+    static const std::chrono::milliseconds limit = [] {
+        const char* value = std::getenv("EDEN_NX2_VIDEO_RELEASE_WAIT_MS");
+        if (value == nullptr || value[0] == '\0') {
+            return std::chrono::milliseconds{100};
+        }
+        return std::chrono::milliseconds{std::clamp(std::atoi(value), 0, 1000)};
+    }();
+    return limit;
 }
 
 // Native memory and images handed out by the Switch 2 graphics server (gsv 111/114/423/429/315),
@@ -1888,7 +1871,7 @@ private:
                          "sleep_actual_wall_ms={:.3f} pace_wall_ms={:.3f} deadline_reset={}",
                          m_presents, w[12], w[12] >> 16, w[12] & 0xffff,
                          m_frame_trace.interval, m_frame_trace.refresh, m_frame_trace.forced,
-                         Settings::values.use_speed_limit.GetValue(), Settings::SpeedLimit(),
+                         Settings::SpeedLimitEnabled(), Settings::SpeedLimit(),
                          m_frame_trace.switches, m_frame_trace.switch_from,
                          m_frame_trace.switch_to,
                          m_frame_trace.last_present == std::chrono::steady_clock::time_point{}
@@ -1962,6 +1945,8 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
+    u32 m_oot_scale_bits{}; // the speed scale last written (SetOotSpeedScale), 0 = none yet
+    bool m_oot_vsync_set{}; // the vsync event follows Ocarina's high refresh rate mode
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
@@ -1973,18 +1958,60 @@ private:
         bool deadline_reset{};
     } m_frame_trace;
 
-    /**
-     * Holds this present until the next vblank its word asks for, or for longer when an FPS limit
-     * (the setting, or EDEN_NX2_FPS_LIMIT) is below that rate.
-     *
-     * Fire Emblem: Fortune's Weave sends 0x1003c during its boot logos and 0x2003c (two vblanks
-     * per frame, 30 fps) after; paced at every vblank it ran at double speed.
-     * EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-     *
-     * @param timing  Present word 12: (swap interval << 16) | refresh rate.
-     * @param process Owning process, for the Mario Kart World dynamic FPS case; may be null.
-     */
-    void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
+    /// Ocarina of Time's high refresh rate routine: its speed scale word follows the speed limit
+    /// (Turbo, Slow, the Standard percentage; 1.0 when unlocked). Written when the word in memory
+    /// differs: switching the mode live (Ctrl+U) writes the routine again with 1.0.
+    void SetOotSpeedScale(Kernel::KProcess& process) {
+        const u16 limit = Settings::SpeedLimit();
+        const float scale = Settings::values.use_speed_limit.GetValue() && limit != 0
+                                ? static_cast<float>(limit) / 100.0f
+                                : 1.0f;
+        u32 bits;
+        std::memcpy(&bits, &scale, sizeof(bits));
+        if (process.UpdateOotHighRefreshScale(bits) &&
+            bits != std::exchange(m_oot_scale_bits, bits)) {
+            LOG_INFO(Service, "Ocarina of Time high refresh rate: speed scale {:.2f}", scale);
+        }
+    }
+
+    /// Ocarina of Time's frame period with the high refresh rate patch: the chosen cap, never
+    /// faster than the display (FIFO would not show those frames; the host pacer holds them).
+    /// "Monitor refresh" before the display's rate is known: 60 Hz.
+    static std::chrono::nanoseconds OotHighRefreshInterval() {
+        long long hz = 0;
+        switch (Settings::values.oot_high_refresh_cap.GetValue()) {
+        case Settings::OotRefreshCap::Hz90:
+            hz = 90;
+            break;
+        case Settings::OotRefreshCap::Hz120:
+            hz = 120;
+            break;
+        case Settings::OotRefreshCap::Hz144:
+            hz = 144;
+            break;
+        case Settings::OotRefreshCap::Hz165:
+            hz = 165;
+            break;
+        case Settings::OotRefreshCap::Display:
+        default:
+            break;
+        }
+        const long long display =
+            VideoCommon::Nx2Perf::g_display_refresh_ns.load(std::memory_order_relaxed);
+        long long ns = hz != 0 ? 1'000'000'000LL / hz : display;
+        if (display > 0) {
+            ns = (std::max)(ns, display);
+        }
+        if (ns <= 0) {
+            ns = 1'000'000'000LL / 60;
+        }
+        return std::chrono::nanoseconds{ns};
+    }
+
+    // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
+    // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
+    // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
+    void PaceToVblank(u32 timing, Kernel::KProcess* process) {
         Common::Nx2Timeline::Span timeline_span{"present: pace to vblank"};
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
@@ -2026,6 +2053,29 @@ private:
             m_frame_trace.refresh = refresh_rate;
             m_frame_trace.forced = forced_interval;
         }
+        // Ocarina of Time with the high refresh rate patch (Settings oot_high_refresh, off by
+        // default): its step always follows real time, so pacing alone no longer sets its speed.
+        // The speed limit (Turbo, Slow) scales the step through the routine's scale word instead,
+        // and outside the 30 FPS mode frames are paced at the chosen cap, not the game's 60 Hz.
+        const u64 oot_scale_address = process != nullptr &&
+                                              process->GetProgramId() == OcarinaOfTimeId
+                                          ? process->GetOotHighRefreshScaleAddress()
+                                          : 0;
+        const bool high_refresh = oot_scale_address != 0 && !Settings::values.oot_30fps.GetValue();
+        if (oot_scale_address != 0) {
+            SetOotSpeedScale(*process);
+            // The game starts its frames on the vsync event: at the cap, unlocked at 240 Hz.
+            SetVsyncInterval(!high_refresh ? DefaultVblankInterval()
+                             : Settings::SpeedLimitEnabled() ? OotHighRefreshInterval()
+                                                             : std::chrono::nanoseconds{
+                                                                   1'000'000'000LL / 240});
+            m_oot_vsync_set = true;
+        } else if (std::exchange(m_oot_vsync_set, false)) {
+            // Switched off while the game runs (Ctrl+U): the vsync event back at its default.
+            SetVsyncInterval(DefaultVblankInterval());
+        }
+        // The FPS limit can cap the game below its own rate (setting, or EDEN_NX2_FPS_LIMIT),
+        // with or without the speed limit.
         static const u32 forced_fps_limit = [] {
             const char* value = std::getenv("EDEN_NX2_FPS_LIMIT");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
@@ -2033,7 +2083,7 @@ private:
         const u32 fps_limit =
             forced_fps_limit != 0 ? forced_fps_limit : Settings::values.fps_limit.GetValue();
         const bool speed_limited =
-            Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() != 0;
+            Settings::SpeedLimitEnabled() && Settings::SpeedLimit() != 0;
         if (!speed_limited && fps_limit == 0) {
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
@@ -2043,9 +2093,13 @@ private:
                      "nx2:vi2 present #{} swap interval {} at {} Hz, FPS limit {} (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, fps_limit, timing);
         }
-        auto interval = std::chrono::nanoseconds{
-            100'000'000'000LL * swap_interval / refresh_rate /
-            (speed_limited ? Settings::SpeedLimit() : 100)};
+        auto interval =
+            high_refresh
+                ? OotHighRefreshInterval()
+                : std::chrono::nanoseconds{100'000'000'000LL * swap_interval / refresh_rate /
+                                           (oot_scale_address != 0 || !speed_limited
+                                                ? 100
+                                                : Settings::SpeedLimit())};
         // Genlock: with the host frame pacer on, a frame period within 1% of a whole number of
         // display refreshes becomes exactly that many measured refreshes (a "120 Hz" display at
         // 119.98 Hz: 33.3389 ms instead of 33.3333). On the game's own clock its frames drifted
@@ -2660,23 +2714,48 @@ private:
         }
     }
 
+    // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on the vsync event, so a
+    // frame that misses a 60 Hz tick idles until the next one.
+    static const char* VsyncHzOverride() {
+        static const char* const text = std::getenv("EDEN_NX2_VSYNC_HZ");
+        return text;
+    }
+
+    static std::chrono::nanoseconds DefaultVblankInterval() {
+        static const std::chrono::nanoseconds interval{[] {
+            const char* text = VsyncHzOverride();
+            const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
+            return 1'000'000'000LL / hz;
+        }()};
+        return interval;
+    }
+
+    /// A vsync event period other than the default from the next tick on (Ocarina of Time's high
+    /// refresh rate). EDEN_NX2_VSYNC_HZ wins.
+    void SetVsyncInterval(std::chrono::nanoseconds interval) {
+        if (VsyncHzOverride() == nullptr) {
+            m_vsync->interval_ns.store(interval.count(), std::memory_order_relaxed);
+        }
+    }
+
     void StartVsyncTimer() {
         if (!m_vsync_timer) {
-            // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
-            // frame that misses a 60 Hz tick idles until the next one.
-            static const std::chrono::nanoseconds VblankInterval{[] {
-                const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
-                const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
-                return 1'000'000'000LL / hz;
-            }()};
+            const std::chrono::nanoseconds VblankInterval = DefaultVblankInterval();
             m_vsync_timer = Core::Timing::CreateEvent(
                 "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel()](
+                [vsync_state = m_vsync, &kernel = system.Kernel(), VblankInterval](
                     s64 scheduled,
                     std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
+                    }
+                    // 0 = the default period, as scheduled.
+                    std::optional<std::chrono::nanoseconds> next;
+                    if (const s64 interval_ns =
+                            vsync_state->interval_ns.load(std::memory_order_relaxed);
+                        interval_ns > 0) {
+                        next = std::chrono::nanoseconds{interval_ns};
                     }
                     if (Common::DkbFrameTrace::Enabled()) {
                         const s64 observed = scheduled + late.count();
@@ -2708,7 +2787,7 @@ private:
                             vsync_state->trace_min_gap.reset();
                         }
                     }
-                    return std::nullopt;
+                    return next;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
@@ -2727,6 +2806,7 @@ private:
         s64 trace_max_late{};
         u64 trace_callbacks{}, trace_late_callbacks{};
         std::atomic<u64> trace_present{};
+        std::atomic<s64> interval_ns{}; // SetVsyncInterval; 0 = the default period
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
@@ -2834,7 +2914,72 @@ private:
         u32 height;
         u64 pts;
         bool end;
+        std::chrono::steady_clock::time_point ready{}; ///< When it was written (trace)
     };
+    /// A frame converted for its output image, waiting to be copied in (PrepareImage).
+    struct PreparedImage {
+        bool write{}; ///< false: nothing to copy (no picture, no memory, image destroyed)
+        u64 address{};
+        u32 parent{};
+        u64 parent_offset{};
+        Nx2DecoderImageLayout layout{};
+        bool block_linear{};
+        u32 width{};
+        u32 height{};
+    };
+    /// EDEN_NX2_VIDEO_TRACE: one stage's time over a report window.
+    struct Timing {
+        u64 count{};
+        double total_ms{};
+        double max_ms{};
+        void Add(std::chrono::steady_clock::duration duration) {
+            const double ms = std::chrono::duration<double, std::milli>(duration).count();
+            ++count;
+            total_ms += ms;
+            max_ms = std::max(max_ms, ms);
+        }
+        double Average() const {
+            return count != 0 ? total_ms / static_cast<double>(count) : 0.0;
+        }
+    };
+    /// EDEN_NX2_VIDEO_TRACE state of the movie playing (m_mutex).
+    struct SyncTrace {
+        bool started{};
+        bool hardware{};
+        std::chrono::steady_clock::time_point wall0{};
+        std::chrono::steady_clock::time_point window0{};
+        u64 pts0{};
+        u64 last_pts{};
+        u64 audio0{};
+        u64 window_starved0{};
+        s64 guest0_ns{};
+        u64 frames{};
+        u64 window_frames{};
+        u64 empty_polls{};
+        u64 dropped{}; ///< Decoded frames skipped by EDEN_NX2_VIDEO_PTS_SYNC (window)
+        u64 held{};    ///< Times a frame not yet due waited (window)
+        double last_late_ms{};
+        Timing decode;
+        Timing convert;
+        Timing fence;
+        Timing write;
+        Timing pickup;
+    };
+    /// EDEN_NX2_VIDEO_PTS_SYNC: the playback clock of the movie playing (m_mutex).
+    struct PlaybackClock {
+        bool started{};
+        bool audio{};       ///< Clocked by the audio played, else by the wall clock
+        std::chrono::steady_clock::time_point wall0{};
+        u64 audio0{};
+        u64 pts0{};         ///< Timestamp (us) of the first frame the game took
+        u64 last_pts{};     ///< Of the last written frame
+        u64 last_decoded_pts{};
+        s64 interval_us{16'667}; ///< Between decoded frames (average)
+        std::chrono::steady_clock::time_point hold_since{};
+        std::chrono::microseconds hold_wait{};
+        u64 dropped{};      ///< This movie
+    };
+    enum class ClockPick { Write, DecodeMore, Hold };
     struct Fence {
         u32 syncpoint;
         u32 value;
@@ -2843,7 +2988,6 @@ private:
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
-    static constexpr u32 MaxDroppedInARow = 30; // see DropOvertakenFrames
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2926,8 +3070,6 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
-            m_clock.Reset();
-            m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -3100,12 +3242,14 @@ private:
                          m_decoded.size(), m_outputs.size(), m_decoded_frames, m_frames_out,
                          m_stream_ended, m_end_queued);
             }
+            if (Nx2VideoSyncTraceEnabled()) {
+                TraceEnd(ctx.GetCommand() == 8 ? ", flush" : ", stop");
+            }
             m_inputs.Clear();
+            m_clock.started = false;
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
-            m_clock.Reset();
-            m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
             // fence as a frame to acquire.
@@ -3129,49 +3273,12 @@ private:
                          m_syncpoint, m_inputs.Size(), m_decoded.size(), m_outputs.size(),
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
+            if (Nx2VideoSyncTraceEnabled()) {
+                TraceEnd(", finalize");
+            }
             CompleteHandedFences();
-            m_clock.Reset();
-            m_stream_start.reset();
         }
         TipcReplyWords(ctx, {});
-    }
-
-    s64 HostTimeUs() const {
-        return system.CoreTiming().GetGlobalTimeUs().count();
-    }
-
-    // When emulation last resumed from a pause: the movie's audio stopped meanwhile.
-    s64 PauseEndUs() const {
-        return system.CoreTiming().GetPauseEndTime().count() / 1000;
-    }
-
-    // Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
-    // one, while the movie's audio plays in real time: below the movie's frame rate the picture
-    // falls further behind the sound. Drop decoded frames a later frame has already overtaken
-    // (m_mutex held). Returns true when the only frame left is late and more input is queued:
-    // decode on before filling an image.
-    bool DropOvertakenFrames() {
-        if (m_decoded.empty()) {
-            return false;
-        }
-        const auto due = m_clock.Due(HostTimeUs(), PauseEndUs());
-        if (!due) {
-            m_dropped_in_a_row = 0;
-            return false;
-        }
-        while (m_decoded.size() >= 2 && m_dropped_in_a_row < MaxDroppedInARow) {
-            const Decoded& front = m_decoded[0];
-            const Decoded& next = m_decoded[1];
-            if (front.end || !front.picture || next.pts <= front.pts || next.pts > *due) {
-                break;
-            }
-            m_decoded.pop_front();
-            ++m_frames_dropped;
-            ++m_dropped_in_a_row;
-        }
-        const Decoded& front = m_decoded.front();
-        return m_decoded.size() == 1 && !m_inputs.Empty() && !front.end &&
-               m_dropped_in_a_row < MaxDroppedInARow && front.pts + m_frame_interval < *due;
     }
 
     // Advances the decoder's syncpoint to the last value handed out (m_mutex held).
@@ -3200,7 +3307,23 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                m_clock.Acquired(HostTimeUs(), output->pts, PauseEndUs());
+                if (Nx2VideoPtsSyncEnabled() &&
+                    output->ready != std::chrono::steady_clock::time_point{}) {
+                    // How long a written frame waits for the game: frames are picked that far
+                    // ahead of the clock.
+                    const double us = std::chrono::duration<double, std::micro>(
+                                          std::chrono::steady_clock::now() - output->ready)
+                                          .count();
+                    m_pickup_us = m_pickup_us == 0.0 ? us : m_pickup_us * 0.9 + us * 0.1;
+                }
+                if (Nx2VideoPtsSyncEnabled()) {
+                    StartClock(*output);
+                }
+                if (Nx2VideoSyncTraceEnabled()) {
+                    TraceAcquired(*output);
+                }
+            } else if (Nx2VideoSyncTraceEnabled()) {
+                ++m_sync.empty_polls;
             }
         }
         if (!output) {
@@ -3244,8 +3367,7 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
-                m_last_decoded_pts = 0;
-                m_dropped_in_a_row = 0;
+                m_clock.started = false;
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -3253,8 +3375,25 @@ private:
                 }
                 continue;
             }
-            if (!m_decoded.empty() && !m_free.empty() && !DropOvertakenFrames()) {
-                m_dropped_in_a_row = 0;
+            bool write = !m_decoded.empty() && !m_free.empty();
+            if (write && Nx2VideoPtsSyncEnabled()) {
+                switch (PickByClock()) {
+                case ClockPick::Write:
+                    break;
+                case ClockPick::DecodeMore:
+                    write = false;
+                    break;
+                case ClockPick::Hold:
+                    if (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead) {
+                        // Decode ahead while the frame waits.
+                        write = false;
+                        break;
+                    }
+                    m_cv.wait_for(lk, m_clock.hold_wait, [&] { return m_quit || m_flush; });
+                    continue;
+                }
+            }
+            if (write) {
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
                 const u32 image = m_free.front();
@@ -3265,13 +3404,41 @@ private:
                     m_release_fences.erase(it);
                 }
                 lk.unlock();
+                // Convert first: that only fills this thread's buffers, so it needn't wait for
+                // the game's reads of the image to pass; only the copy into the image does. With
+                // two output images (Ocarina of Time's movies) that wait is on the path of every
+                // frame, and the conversion was on it too.
+                const auto convert_start = std::chrono::steady_clock::now();
+                PreparedImage prepared{};
+                u32 width = m_width;
+                u32 height = m_height;
+                try {
+                    prepared = PrepareImage(decoder.get(), image, frame, bytes);
+                } catch (const std::exception& e) {
+                    // A frame must never end the game (std::bad_alloc on a huge image).
+                    LOG_ERROR(Service, "{} converting a frame failed: {}", GetServiceName(),
+                              e.what());
+                    prepared = PreparedImage{};
+                    prepared.width = width;
+                    prepared.height = height;
+                }
+                const auto fence_start = std::chrono::steady_clock::now();
                 if (fence) {
                     WaitForRelease(*fence);
                 }
-                const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                const auto write_start = std::chrono::steady_clock::now();
+                const auto size = CommitImage(decoder.get(), image, frame, prepared, bytes);
+                width = size.first;
+                height = size.second;
+                const auto write_end = std::chrono::steady_clock::now();
                 lk.lock();
+                if (Nx2VideoSyncTraceEnabled()) {
+                    m_sync.convert.Add(fence_start - convert_start);
+                    m_sync.fence.Add(write_start - fence_start);
+                    m_sync.write.Add(write_end - write_start);
+                }
                 // Even an image written during a flush counts: the client waits for its value.
-                m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                m_outputs.push_back({image, width, height, frame.pts, frame.end, write_end});
                 if (frame.end) {
                     m_stream_ended = true;
                     m_end_queued = false;
@@ -3279,30 +3446,22 @@ private:
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
+                if (Nx2VideoPtsSyncEnabled()) {
+                    NoteWritten(frame);
+                }
                 if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
                     system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
                     DrainFreeAsEndOfStream();
                 }
                 ++m_frames_out;
-                const s64 written_us = HostTimeUs();
-                if (!m_stream_start) {
-                    m_stream_start = {written_us, frame.pts};
-                }
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
-                    // How far the frames written lag their timestamps since the stream's first.
-                    const s64 behind_us =
-                        (written_us - m_stream_start->first) -
-                        (static_cast<s64>(frame.pts) - static_cast<s64>(m_stream_start->second));
-                    LOG_INFO(Service,
-                             "{} frame {} ({}x{}, pts {} us{}) in image {}, {} late dropped, "
-                             "{} ms behind",
+                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
                              GetServiceName(), m_frames_out, width, height, frame.pts,
-                             frame.end ? ", end of stream" : "", image, m_frames_dropped,
-                             behind_us / 1000);
+                             frame.end ? ", end of stream" : "", image);
                 }
-                if (frame.end) {
-                    m_stream_start.reset();
-                }
+                continue;
+            }
+            if (m_inputs.Empty()) {
                 continue;
             }
             Input input = m_inputs.Pop();
@@ -3329,11 +3488,21 @@ private:
                 decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
-            decoder->Decode(input.data, input.pts, pictures);
-            if (input.end) {
-                decoder->Drain(pictures);
+            const auto decode_start = std::chrono::steady_clock::now();
+            try {
+                decoder->Decode(input.data, input.pts, pictures);
+                if (input.end) {
+                    decoder->Drain(pictures);
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR(Service, "{} decoding a frame failed: {}", GetServiceName(), e.what());
             }
+            const auto decode_time = std::chrono::steady_clock::now() - decode_start;
             lk.lock();
+            if (Nx2VideoSyncTraceEnabled()) {
+                m_sync.decode.Add(decode_time);
+                m_sync.hardware = decoder->UsingHardware();
+            }
             m_decoded_frames += pictures.size();
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
@@ -3347,11 +3516,21 @@ private:
             }
             for (auto& picture : pictures) {
                 const u64 pts = picture.pts;
-                if (pts > m_last_decoded_pts && pts - m_last_decoded_pts <= 100'000) {
-                    m_frame_interval = pts - m_last_decoded_pts;
+                if (Nx2VideoPtsSyncEnabled()) {
+                    // The movie's frame interval, for how far ahead a frame counts as due.
+                    const s64 delta = static_cast<s64>(pts - m_clock.last_decoded_pts);
+                    if (delta > 1'000 && delta < 200'000) {
+                        m_clock.interval_us = (m_clock.interval_us * 7 + delta) / 8;
+                    }
+                    m_clock.last_decoded_pts = pts;
                 }
-                m_last_decoded_pts = pts;
                 m_decoded.push_back({std::move(picture), pts, false});
+            }
+            if (pictures.empty() && !input.end && decoder->Failed()) {
+                // The decoder stopped mid-movie (it faulted): still answer each input with a
+                // frame, without a picture, so the game's movie runs to its end instead of
+                // waiting for frames forever.
+                m_decoded.push_back({std::nullopt, input.pts, false});
             }
             if (input.end) {
                 // The client stops at the frame marked end of stream; give it one even when the
@@ -3362,6 +3541,111 @@ private:
                     m_decoded.back().end = true;
                 }
             }
+        }
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: the playback clock's timestamp (us) a frame written now should
+    // have: the movie's first timestamp, plus the audio played since (or the wall time), plus
+    // how long the game takes to pick a written frame up (m_mutex held).
+    s64 TargetPts(std::chrono::steady_clock::time_point now) {
+        auto& c = m_clock;
+        const double wall_us = std::chrono::duration<double, std::micro>(now - c.wall0).count();
+        double clock_us = wall_us;
+        if (c.audio) {
+            const u64 played =
+                AudioCore::Sink::GetRenderOutputClock().played.load(std::memory_order_relaxed);
+            const double audio_us =
+                static_cast<double>(played - c.audio0) * 1e6 / AudioCore::TargetSampleRate;
+            if (wall_us > 500'000.0 && audio_us < wall_us / 4) {
+                // No audio counted (another sink, or none playing): follow the wall clock.
+                c.audio = false;
+                LOG_INFO(Service, "{} movie clock: no audio played, using the wall clock",
+                         GetServiceName());
+            } else {
+                clock_us = audio_us;
+            }
+        }
+        const double lead_us = std::min(m_pickup_us, 50'000.0);
+        return static_cast<s64>(c.pts0) + static_cast<s64>(clock_us + lead_us);
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: an output image is free; drops the decoded frames the clock has
+    // passed and says whether to write the front one now, decode further first, or wait
+    // (m_mutex held, m_decoded not empty).
+    ClockPick PickByClock() {
+        auto& c = m_clock;
+        if (!c.started) {
+            return ClockPick::Write;
+        }
+        if (m_decoded.front().pts < c.last_pts) {
+            // Timestamps went back: another movie (or the same one again). Start over.
+            c.started = false;
+            return ClockPick::Write;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const s64 target = TargetPts(now);
+        const s64 tolerance = c.interval_us / 2;
+        const auto due = [&](u64 pts) { return static_cast<s64>(pts) <= target + tolerance; };
+        // Keep the newest due frame; never drop the end of the stream.
+        while (m_decoded.size() >= 2 && !m_decoded.front().end && due(m_decoded[1].pts)) {
+            m_decoded.pop_front();
+            ++c.dropped;
+            ++m_sync.dropped;
+        }
+        const Decoded& front = m_decoded.front();
+        if (due(front.pts)) {
+            c.hold_since = {};
+            // The next frame would be due too: decode it first (input is usually queued).
+            if (m_decoded.size() == 1 && !front.end && !m_inputs.Empty() &&
+                due(front.pts + static_cast<u64>(std::max<s64>(c.interval_us, 1)))) {
+                return ClockPick::DecodeMore;
+            }
+            return ClockPick::Write;
+        }
+        // Not due yet: wait for it, never hand out a frame early. A clock that doesn't move
+        // (audio stalled) only delays it, by 250 ms at most.
+        if (c.hold_since == std::chrono::steady_clock::time_point{}) {
+            c.hold_since = now;
+            ++m_sync.held;
+        } else if (now - c.hold_since >= std::chrono::milliseconds{250}) {
+            c.hold_since = {};
+            return ClockPick::Write;
+        }
+        const s64 early_us = static_cast<s64>(front.pts) - (target + tolerance);
+        c.hold_wait = std::chrono::microseconds{std::clamp<s64>(early_us, 1'000, 20'000)};
+        return ClockPick::Hold;
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: the game took a frame (213). The first of a movie starts its
+    // clock: the game starts showing it (and, presumably, its audio) now, which can be well
+    // after the first frames were written (m_mutex held).
+    void StartClock(const Output& output) {
+        auto& c = m_clock;
+        // Not on the end of a stream, nor on a frame of an earlier movie still in an image
+        // (newer frames were written since).
+        if (c.started || output.end || output.pts > c.last_pts) {
+            return;
+        }
+        c.started = true;
+        c.audio = AudioCore::Sink::RenderOutputClockEnabled();
+        c.wall0 = std::chrono::steady_clock::now();
+        c.audio0 = AudioCore::Sink::GetRenderOutputClock().played.load(std::memory_order_relaxed);
+        c.pts0 = output.pts;
+        c.hold_since = {};
+        c.dropped = 0;
+    }
+
+    // EDEN_NX2_VIDEO_PTS_SYNC: a frame went into an output image (m_mutex held).
+    void NoteWritten(const Decoded& frame) {
+        auto& c = m_clock;
+        c.last_pts = frame.pts;
+        if (frame.end) {
+            if (c.started && c.dropped != 0) {
+                LOG_INFO(Service, "{} movie ended: {} late frames skipped to keep up with the "
+                                  "{} clock",
+                         GetServiceName(), c.dropped, c.audio ? "audio" : "wall");
+            }
+            c.started = false;
         }
     }
 
@@ -3381,16 +3665,39 @@ private:
         return static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
     }
 
-    // Waits (bounded) until the client's reads of an image it gave back have passed.
+    // Waits (bounded, EDEN_NX2_VIDEO_RELEASE_WAIT_MS) until the client's reads of an image it
+    // gave back have passed: until the GPU thread reaches the release fence.
     void WaitForRelease(const Fence& fence) {
         if (fence.syncpoint >= HostSyncpoints) {
             return;
         }
         auto& syncpoints = system.Host1x().GetSyncpointManager();
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
-        while (!syncpoints.IsReadyGuest(fence.syncpoint, fence.value) &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        const auto limit = Nx2VideoReleaseWaitLimit();
+        if (limit.count() > 0 && !syncpoints.IsReadyGuest(fence.syncpoint, fence.value)) {
+            // Woken by the increment itself: polling every 1 ms added up to a millisecond or two
+            // to every frame (Windows sleeps).
+            struct Waiter {
+                std::mutex mutex;
+                std::condition_variable cv;
+                bool done{};
+            };
+            auto waiter = std::make_shared<Waiter>();
+            const auto handle =
+                syncpoints.RegisterGuestAction(fence.syncpoint, fence.value, [waiter] {
+                    {
+                        std::scoped_lock lk{waiter->mutex};
+                        waiter->done = true;
+                    }
+                    waiter->cv.notify_all();
+                });
+            bool done;
+            {
+                std::unique_lock lk{waiter->mutex};
+                done = waiter->cv.wait_for(lk, limit, [&] { return waiter->done; });
+            }
+            if (!done) {
+                syncpoints.DeregisterGuestAction(fence.syncpoint, handle);
+            }
         }
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace release wait syncpoint={} value={} reached={}",
@@ -3399,14 +3706,14 @@ private:
         }
     }
 
-    // Writes a decoded frame into an output image; returns the size the frame reports.
-    std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
-                                   const Decoded& frame, std::vector<u8>& bytes) {
-        u64 address{};
-        u32 parent{};
-        u64 parent_offset{};
-        Nx2DecoderImageLayout layout{};
-        bool block_linear{};
+    // Converts a decoded frame for an output image into this thread's buffers (`bytes`, and
+    // m_tiled for a block-linear image). Touches no guest memory: it may run while the game
+    // still reads the image.
+    PreparedImage PrepareImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
+                               const Decoded& frame, std::vector<u8>& bytes) {
+        PreparedImage prepared{};
+        prepared.width = m_width;
+        prepared.height = m_height;
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
@@ -3415,86 +3722,227 @@ private:
                     LOG_INFO(Service, "nx2:vdec trace write skipped syncpoint={} image={} destroyed",
                              m_syncpoint, image_id);
                 }
-                return {m_width, m_height};
+                return prepared;
             }
-            layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
-            block_linear = image->second.gpu_read &&
-                           layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12;
+            prepared.layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
+            prepared.block_linear = image->second.gpu_read &&
+                                    prepared.layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12;
             const auto memory = m_objects->memories.find(image->second.memory);
             if (memory != m_objects->memories.end() && memory->second.address != 0) {
-                address = memory->second.address + image->second.offset;
-                parent = memory->second.parent;
-                parent_offset = memory->second.parent_offset + image->second.offset;
+                prepared.address = memory->second.address + image->second.offset;
+                prepared.parent = memory->second.parent;
+                prepared.parent_offset = memory->second.parent_offset + image->second.offset;
             }
         }
-        if (!frame.picture || decoder == nullptr || address == 0 ||
+        const auto& layout = prepared.layout;
+        prepared.width = std::min(m_width, layout.width);
+        prepared.height = std::min(m_height, layout.height);
+        if (!frame.picture || decoder == nullptr || prepared.address == 0 ||
             system.ApplicationProcess() == nullptr) {
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
                          "nx2:vdec trace write skipped syncpoint={} image={} cpu={:#x} picture={} eos={}",
-                         m_syncpoint, image_id, address, frame.picture.has_value(), frame.end);
+                         m_syncpoint, image_id, prepared.address, frame.picture.has_value(),
+                         frame.end);
             }
-            return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
+            return prepared;
         }
-        const auto trace_write = [&] {
-            if (!Nx2VideoTraceEnabled()) {
-                return;
-            }
-            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
-            auto gpu_address = registry.GpuAddressOf(parent, parent_offset);
-            const auto device = registry.DeviceAddressOf(address);
-            if (!gpu_address && device && registry.DeviceAddressOfGpu(address) == device) {
-                gpu_address = address;
-            }
-            LOG_INFO(Service,
-                     "nx2:vdec trace write syncpoint={} decoded_frames={} output={} codec={} "
-                     "image={} cpu={:#x} gpu={:#x} gpu_known={} device={:#x} mapped={} "
-                     "format={} block_linear={} pitch={} chroma={:#x} pts={} eos={}",
-                     m_syncpoint, m_decoded_frames, m_frames_out + 1, decoder->Name(), image_id,
-                     address, gpu_address.value_or(0), gpu_address.has_value(),
-                     device.value_or(0), device.has_value(), static_cast<u32>(layout.format),
-                     block_linear, layout.pitch, layout.chroma_offset, frame.pts, frame.end);
-            std::scoped_lock lk{m_objects->mutex};
-            m_objects->last_video_write = Nx2NativeObjects::VideoTrace{
-                m_syncpoint, m_decoded_frames, image_id, gpu_address.value_or(0),
-                device.value_or(0), frame.pts, decoder->Name()};
-        };
         // A frame larger than the image is scaled down to it.
-        const u32 width = std::min(frame.picture->width, layout.width);
-        const u32 height = std::min(frame.picture->height, layout.height);
+        prepared.width = std::min(frame.picture->width, layout.width);
+        prepared.height = std::min(frame.picture->height, layout.height);
         bytes.resize(layout.size);
-        auto& memory = system.ApplicationMemory();
-        if (block_linear) {
+        if (prepared.block_linear) {
             // Read on the GPU: RGBA (the blit's format 0xd5) in the native block-linear layout,
             // 16-GOB blocks, as our Eden tree writes these images.
-            decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, width, height,
-                            layout.pitch, 0, bytes);
-            DumpFrame(image_id, bytes, layout, width, height);
+            decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, prepared.width,
+                            prepared.height, layout.pitch, 0, bytes);
+            DumpFrame(image_id, bytes, layout, prepared.width, prepared.height);
             m_tiled.resize(layout.size);
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
                                            layout.height, 1, 4, 0, 1, true);
-            memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
+        } else {
+            decoder->Render(*frame.picture, layout.format, prepared.width, prepared.height,
+                            layout.pitch, layout.chroma_offset, bytes);
+            DumpFrame(image_id, bytes, layout, prepared.width, prepared.height);
+        }
+        prepared.write = true;
+        return prepared;
+    }
+
+    // Copies a prepared frame into its output image; returns the size the frame reports.
+    std::pair<u32, u32> CommitImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
+                                    const Decoded& frame, const PreparedImage& prepared,
+                                    const std::vector<u8>& bytes) {
+        if (!prepared.write) {
+            return {prepared.width, prepared.height};
+        }
+        {
+            // Destroyed or moved while this thread waited for the game's reads: leave it.
+            std::scoped_lock lk{m_objects->mutex};
+            const auto image = m_objects->images.find(image_id);
+            u64 address = 0;
+            if (image != m_objects->images.end()) {
+                const auto memory = m_objects->memories.find(image->second.memory);
+                if (memory != m_objects->memories.end() && memory->second.address != 0) {
+                    address = memory->second.address + image->second.offset;
+                }
+            }
+            if (address != prepared.address) {
+                if (Nx2VideoTraceEnabled()) {
+                    LOG_INFO(Service,
+                             "nx2:vdec trace write skipped syncpoint={} image={} gone before the "
+                             "copy",
+                             m_syncpoint, image_id);
+                }
+                return {prepared.width, prepared.height};
+            }
+        }
+        const auto& layout = prepared.layout;
+        auto& memory = system.ApplicationMemory();
+        if (prepared.block_linear) {
+            memory.WriteBlock(prepared.address, m_tiled.data(), m_tiled.size());
             if (const auto device =
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(prepared.address)) {
                 system.GPU().InvalidateRegion(*device, m_tiled.size());
             }
-            trace_write();
-            return {width, height};
+        } else {
+            memory.WriteBlock(prepared.address, bytes.data(), layout.pitch * prepared.height);
+            if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
+                memory.WriteBlock(prepared.address + layout.chroma_offset,
+                                  bytes.data() + layout.chroma_offset,
+                                  layout.pitch * ((prepared.height + 1) / 2));
+            }
+            // The game samples the image on the GPU: drop the texture cache's copy of the old
+            // frame.
+            if (const auto device =
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(prepared.address)) {
+                system.GPU().InvalidateRegion(*device, layout.size);
+            }
         }
-        decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
-                        layout.chroma_offset, bytes);
-        DumpFrame(image_id, bytes, layout, width, height);
-        memory.WriteBlock(address, bytes.data(), layout.pitch * height);
-        if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
-            memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
-                              layout.pitch * ((height + 1) / 2));
+        if (Nx2VideoTraceEnabled()) {
+            TraceWrite(decoder, image_id, frame, prepared);
         }
-        // The game samples the image on the GPU: drop the texture cache's copy of the old frame.
-        if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
-            system.GPU().InvalidateRegion(*device, layout.size);
+        return {prepared.width, prepared.height};
+    }
+
+    void TraceWrite(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id, const Decoded& frame,
+                    const PreparedImage& prepared) {
+        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        auto gpu_address = registry.GpuAddressOf(prepared.parent, prepared.parent_offset);
+        const auto device = registry.DeviceAddressOf(prepared.address);
+        if (!gpu_address && device && registry.DeviceAddressOfGpu(prepared.address) == device) {
+            gpu_address = prepared.address;
         }
-        trace_write();
-        return {width, height};
+        const auto& layout = prepared.layout;
+        LOG_INFO(Service,
+                 "nx2:vdec trace write syncpoint={} decoded_frames={} output={} codec={} "
+                 "image={} cpu={:#x} gpu={:#x} gpu_known={} device={:#x} mapped={} "
+                 "format={} block_linear={} pitch={} chroma={:#x} pts={} eos={}",
+                 m_syncpoint, m_decoded_frames, m_frames_out + 1, decoder->Name(), image_id,
+                 prepared.address, gpu_address.value_or(0), gpu_address.has_value(),
+                 device.value_or(0), device.has_value(), static_cast<u32>(layout.format),
+                 prepared.block_linear, layout.pitch, layout.chroma_offset, frame.pts, frame.end);
+        std::scoped_lock lk{m_objects->mutex};
+        m_objects->last_video_write =
+            Nx2NativeObjects::VideoTrace{m_syncpoint,       m_decoded_frames,
+                                         image_id,          gpu_address.value_or(0),
+                                         device.value_or(0), frame.pts,
+                                         decoder->Name()};
+    }
+
+    // EDEN_NX2_VIDEO_TRACE: the game took a finished frame (213; m_mutex held).
+    void TraceAcquired(const Output& output) {
+        const auto now = std::chrono::steady_clock::now();
+        auto& t = m_sync;
+        if (!t.started || output.pts < t.last_pts) {
+            // A new movie (or the same one from its start): measure from its first frame.
+            const bool hardware = t.hardware;
+            t = SyncTrace{};
+            t.started = true;
+            t.hardware = hardware;
+            t.wall0 = now;
+            t.window0 = now;
+            t.pts0 = output.pts;
+            t.last_pts = output.pts;
+            auto& audio = AudioCore::Sink::GetRenderOutputClock();
+            t.audio0 = audio.played.load(std::memory_order_relaxed);
+            t.window_starved0 = audio.starved.load(std::memory_order_relaxed);
+            t.guest0_ns = system.CoreTiming().GetGlobalTimeNs().count();
+            ++m_sync_movies;
+            LOG_INFO(Service, "nx2 video sync #{}: first frame {}x{} at pts {} us ({})",
+                     m_sync_movies, output.width, output.height, output.pts, m_codec);
+        }
+        t.last_pts = output.pts;
+        ++t.frames;
+        ++t.window_frames;
+        if (output.ready != std::chrono::steady_clock::time_point{}) {
+            t.pickup.Add(now - output.ready);
+        }
+        if (now - t.window0 >= std::chrono::seconds{1} || output.end) {
+            TraceReport(now, output.end ? ", end of stream" : "");
+        }
+    }
+
+    // EDEN_NX2_VIDEO_TRACE: one line on the movie so far and the last window (m_mutex held).
+    // "late": wall time since the first frame minus the timestamps covered, growing when frames
+    // come slower than the movie's rate. "audio ahead": audio the host device played since the
+    // first frame (audio renderer session 0) minus the timestamps covered: the desync heard.
+    void TraceReport(std::chrono::steady_clock::time_point now, std::string_view note) {
+        auto& t = m_sync;
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        const double wall_ms = ms(now - t.wall0);
+        const double pts_ms = static_cast<double>(t.last_pts - t.pts0) / 1000.0;
+        const double late_ms = wall_ms - pts_ms;
+        const double window_s = std::max(ms(now - t.window0) / 1000.0, 0.001);
+        auto& audio = AudioCore::Sink::GetRenderOutputClock();
+        const u64 played = audio.played.load(std::memory_order_relaxed);
+        const u64 starved = audio.starved.load(std::memory_order_relaxed);
+        constexpr double FramesPerMs = AudioCore::TargetSampleRate / 1000.0;
+        const double audio_ms = static_cast<double>(played - t.audio0) / FramesPerMs;
+        const double starved_ms = static_cast<double>(starved - t.window_starved0) / FramesPerMs;
+        const double guest_ms =
+            static_cast<double>(system.CoreTiming().GetGlobalTimeNs().count() - t.guest0_ns) / 1e6;
+        LOG_INFO(Service,
+                 "nx2 video sync #{}: {:.1f} s, frame {}, {:.1f} fps | video late {:+.0f} ms "
+                 "({:+.0f} this window), audio ahead {:+.0f} ms, audio starved {:.0f} ms, guest "
+                 "clock {:+.0f} ms | no frame for the game {} times | ms avg/max: decode "
+                 "{:.1f}/{:.1f} convert {:.1f}/{:.1f} image wait {:.1f}/{:.1f} write "
+                 "{:.1f}/{:.1f} pickup {:.1f}/{:.1f} | queued: input {} decoded {} finished {} "
+                 "free images {} | pts sync: dropped {} held {} ({} clock) | {} decoder{}",
+                 m_sync_movies, wall_ms / 1000.0, t.frames,
+                 static_cast<double>(t.window_frames) / window_s, late_ms, late_ms - t.last_late_ms,
+                 audio_ms - pts_ms, starved_ms, guest_ms - wall_ms, t.empty_polls,
+                 t.decode.Average(), t.decode.max_ms, t.convert.Average(), t.convert.max_ms,
+                 t.fence.Average(), t.fence.max_ms, t.write.Average(), t.write.max_ms,
+                 t.pickup.Average(), t.pickup.max_ms, m_inputs.Size(), m_decoded.size(),
+                 m_outputs.size(), m_free.size(), t.dropped, t.held,
+                 !Nx2VideoPtsSyncEnabled() ? "off"
+                 : !m_clock.started        ? "idle"
+                 : m_clock.audio           ? "audio"
+                                           : "wall",
+                 t.hardware ? "GPU" : "CPU", note);
+        t.last_late_ms = late_ms;
+        t.window0 = now;
+        t.window_frames = 0;
+        t.empty_polls = 0;
+        t.dropped = 0;
+        t.held = 0;
+        t.window_starved0 = starved;
+        t.decode = {};
+        t.convert = {};
+        t.fence = {};
+        t.write = {};
+        t.pickup = {};
+    }
+
+    // EDEN_NX2_VIDEO_TRACE: the movie stopped (flush, stop, finalize; m_mutex held).
+    void TraceEnd(std::string_view note) {
+        if (m_sync.started) {
+            TraceReport(std::chrono::steady_clock::now(), note);
+            m_sync.started = false;
+        }
     }
 
     // EDEN_NX2_VDEC_DUMP=<dir>: save the luma of every 120th decoded frame, a quarter of its size,
@@ -3529,7 +3977,7 @@ private:
     u64 m_submitted{};
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame
-    std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (WriteImage)
+    std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (PrepareImage)
 
     // Shared with the decode thread.
     std::mutex m_mutex;
@@ -3540,18 +3988,16 @@ private:
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
     u64 m_decoded_frames{};
-    u64 m_frames_dropped{};
-    Nx2MovieClock m_clock;
-    u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
-    u64 m_last_decoded_pts{};
-    u32 m_dropped_in_a_row{};
-    std::optional<std::pair<s64, u64>> m_stream_start; ///< Host time (us) and pts of its first frame
     Nx2VideoInputQueue m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
     Output m_last_output{};
+    SyncTrace m_sync;                  ///< EDEN_NX2_VIDEO_TRACE
+    PlaybackClock m_clock;             ///< EDEN_NX2_VIDEO_PTS_SYNC
+    double m_pickup_us{};              ///< Written frame to the game's 213 (average)
+    u32 m_sync_movies{};               ///< Movies the trace has seen in this session
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_end_queued{};
     bool m_flush{};

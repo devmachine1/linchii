@@ -36,10 +36,15 @@ std::vector<BasicSetting*> TunedSettings(Values& values) {
         &values.nvdec_emulation,          // GPU: Ocarina's cutscene videos
         &values.scaling_filter,           // ScaleForce (newer Lichii builds seed FSR)
         &values.resolution_setup,         // 1x: a higher scale left over from other games costs fps
-        &values.anti_aliasing,            // FXAA
+        &values.anti_aliasing,            // None: OoT's own AA (or DLSS) already smooths edges
         &values.cpu_accuracy,             // Auto
         &values.use_disk_shader_cache,    // On: no shader rebuild every boot
         &values.use_vulkan_driver_pipeline_cache, // On
+        // EDS2 and dynamic vertex input: the precompiled OoT recipe is recorded with them, and
+        // players who turned them off (an old AMD crash tip; the crash was shader libraries) had
+        // every graphics pipeline skipped as "for another device" (2026-11-09, RX 9070 XT log).
+        &values.dyna_state,                 // EDS2
+        &values.vertex_input_dynamic_state, // On
     };
 }
 
