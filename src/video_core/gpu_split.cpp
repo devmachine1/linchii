@@ -118,12 +118,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
-    // EDEN_NX2_SPLIT_SAFE_READS=1 (zortos293/Lichii#235): a safe read's flush is queued on the back
-    // rather than run on the front (MemoryManager::FlushRegionForRead), so the split no longer has
-    // to be given up for accuracy. Off by default. It adds a drain per safe read, so measure
-    // before believing it is a win: the point is that accuracy and the split stop being a trade,
-    // not that both must be on.
-    static const bool split_safe_reads = std::getenv("EDEN_NX2_SPLIT_SAFE_READS") != nullptr;
+    // EDEN_NX2_SPLIT_SAFE_READS=0 (zortos293/Lichii#235): a safe read's flush is queued on the
+    // back rather than run on the front (MemoryManager::FlushRegionForRead), so the split no
+    // longer has to be given up for accuracy. On by default (2026-11-10): Fritzi's defaults ship
+    // GPU accuracy High, which skipped the split entirely, and Ocarina of Time in Kokiri Forest
+    // went from ~95 ms game frames to 33-57 ms once it ran (30 fps looking down, 10-15 with the
+    // town in view). It adds a drain per safe read: =0 hands the engines back to the front.
+    static const bool split_safe_reads = [] {
+        const char* value = std::getenv("EDEN_NX2_SPLIT_SAFE_READS");
+        return value == nullptr || value[0] != '0';
+    }();
     const bool allowed =
         (split_safe_reads || (!safe_reads && !Settings::IsGPULevelHigh())) &&
         Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
