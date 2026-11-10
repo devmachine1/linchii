@@ -5911,7 +5911,12 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
+    // The idle age has to outlast a trip through neighbouring areas and back: at 9000 frames
+    // (~2.5 min at 60 fps) Ocarina of Time evicted on nearly every revisit (measured on a 12 GB
+    // RTX 3080: 282 eviction sweeps in a 70-minute session, single frames up to 1.36 s while
+    // evicted pipelines were translated again). 27000 frames is ~7.5 min at 60 fps
+    // (zortos293/Lichii#1107).
+    constexpr u64 EvictAfterFrames = 27000;
     if (frame_count <= EvictAfterFrames) {
         return;
     }
@@ -5929,9 +5934,17 @@ void PipelineCache::EvictUnusedPipelines() {
     const u64 cutoff = frame_count - EvictAfterFrames;
     // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
     // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
-    // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
-    // memory) they go like the rest, so a large cache can't hold their memory all session.
-    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    // again on the GPU thread when it reaches that content. Past the budget they go like the rest,
+    // so a large cache can't hold their memory all session. The budget scales with the device's
+    // memory: one pipeline per 3 MiB of video memory (~15% of it at ~0.45 MB each), between the
+    // old flat floor of 2000 (~0.9 GB) and 10000. The flat budget discarded most of what the boot
+    // precache had built for a title whose cache holds tens of thousands of pipelines, and the
+    // rebuilds played as the stutters the precache exists to prevent (zortos293/Lichii#1107).
+    constexpr size_t MinUnusedPrebuiltPipelines = 2000;
+    constexpr size_t MaxUnusedPrebuiltPipelines = 10000;
+    const size_t unused_prebuilt_budget =
+        std::clamp<size_t>(device.GetDeviceLocalMemory() / (size_t{3} << 20),
+                           MinUnusedPrebuiltPipelines, MaxUnusedPrebuiltPipelines);
     size_t kept_prebuilt = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
@@ -5939,7 +5952,7 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->LastUse() >= cutoff) {
             continue;
         }
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+        if (!pipeline->WasUsed() && kept_prebuilt < unused_prebuilt_budget) {
             ++kept_prebuilt;
             continue;
         }
