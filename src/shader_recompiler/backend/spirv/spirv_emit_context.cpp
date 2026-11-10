@@ -1899,6 +1899,14 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         AddExtension("SPV_EXT_mesh_shader");
         AddCapability(spv::Capability::MeshShadingEXT);
     }
+    if (!as_compute && profile.has_broken_mesh_user_sgprs) {
+        // On GFX11+, RADV gives a mesh shader user SGPRs only for the grid size and the draw
+        // index. Without them, binding the shader keeps the last vertex shader's draw index
+        // state, and the next mesh draw writes a SET_SH_REG packet that declares more registers
+        // than it holds: the command processor then hangs. MeshEpilogue reads this variable.
+        mesh_num_workgroups = DefineVariable(*this, U32[3], spv::BuiltIn::NumWorkgroups,
+                                             spv::StorageClass::Input);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
     // The task's output region, which its mesh workgroups read as their input region. In the
