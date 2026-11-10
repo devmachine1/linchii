@@ -6335,6 +6335,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
     }
+    if (!host_info.support_geometry_shader_passthrough) {
+        // Emulated passthrough: only the previous stage's outputs can pass through. Copying all 32
+        // generics exceeds AMD's 128 output components, and amdvlk fail-fasts instead of returning
+        // an error. The previous stage's legacy outputs are generics by now, so the ones they were
+        // mapped to are kept (zortos293/Lichii#1110).
+        const Shader::IR::Program* previous_stage{};
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            Shader::IR::Program& program{programs[index]};
+            if (program.is_geometry_passthrough && previous_stage != nullptr) {
+                Shader::Maxwell::TrimGeometryPassthrough(program, previous_stage->info.stores);
+            }
+            if (key.unique_hashes[index] != 0 || program.is_geometry_passthrough) {
+                previous_stage = &program;
+            }
+        }
+    }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
     // task program, drawing triangles without per-primitive outputs, before a pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
