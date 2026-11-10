@@ -2964,7 +2964,15 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
-    TrimImagePool(ImagePoolMaxBytes);
+    TrimImagePool(ImagePoolCap());
+}
+
+void TextureCacheRuntime::SetPoolUnderPressure(bool pressure) {
+    if (pool_under_pressure == pressure) {
+        return;
+    }
+    pool_under_pressure = pressure;
+    TrimImagePool(ImagePoolCap());
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {

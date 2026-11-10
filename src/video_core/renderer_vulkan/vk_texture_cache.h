@@ -156,6 +156,13 @@ public:
         return image_pool_bytes;
     }
 
+    /// The texture cache is at or over its critical size (TextureCache::TickFrame). The pool then
+    /// holds only ImagePoolPressureBytes: its images are already deleted and only wait to be given
+    /// to a new image of the same shape, so on a card at its budget they keep resident memory from
+    /// live images, which the collector then evicts and has to decode and upload again. Trims now
+    /// (before the collector runs) and caps what PoolImage may add this frame.
+    void SetPoolUnderPressure(bool pressure);
+
     void LogMemoryStatistics() const;
 
     /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
@@ -399,8 +406,13 @@ public:
         u64 frame;
     };
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
+    static constexpr u64 ImagePoolPressureBytes = u64{64} << 20;
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
+    bool pool_under_pressure{};
+    [[nodiscard]] u64 ImagePoolCap() const noexcept {
+        return pool_under_pressure ? ImagePoolPressureBytes : ImagePoolMaxBytes;
+    }
     u64 image_pool_bytes{};
     u64 image_pool_frame{};
     u32 image_pool_seen_pressure{};

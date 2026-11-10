@@ -774,6 +774,14 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    if constexpr (requires { runtime.SetPoolUnderPressure(bool{}); }) {
+        // The image pool holds VkImages the cache already deleted, in device memory the driver
+        // counts but this accounting does not. Over the critical size they are part of what keeps
+        // the card at its budget, so drop most of them before the collector evicts live images
+        // (which it has to decode and upload again): Kokiri Forest on a 4 GiB card ran above the
+        // critical size for minutes with ~300 MiB in the pool.
+        runtime.SetPoolUnderPressure(total_used_memory > critical_memory);
+    }
     if (out_of_memory || total_used_memory > minimum_memory) {
         RunGarbageCollector(out_of_memory);
     }
