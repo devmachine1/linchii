@@ -259,6 +259,18 @@ inline void Nx2ClearSemaphoreRegions() {
     }
 }
 
+/// The GPU address is in the first page of a registered queue semaphore region (nx2:gpu 101 with a
+/// two-page region): waiting channels read the first page, the GPU's releases go to the second.
+[[nodiscard]] inline bool Nx2InSemaphoreFirstPage(u64 gpu_address) {
+    for (auto& region : g_nx2_semaphore_regions) {
+        const u64 start = region.load(std::memory_order_relaxed);
+        if (start != 0 && gpu_address >= start && gpu_address - start < 0x1000) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
 // layer pools, 170 MB-5.8 GB each, of which the game fills a little) get memory per block when the
 // GPU first writes there, not in full. nx2:gpu installs the handler and the span its regions cover;
