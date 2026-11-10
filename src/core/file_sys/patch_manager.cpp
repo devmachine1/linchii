@@ -74,6 +74,10 @@ struct BuiltinPatch {
     /// When set, this environment variable at 1 skips the patch and at 0 applies it even when
     /// Add-Ons has it off (A/B runs without touching the player's Add-Ons).
     const char* disable_env = nullptr;
+    /// When set, the patch applies only while `env_value_env` holds exactly `env_value`: one
+    /// variable with several values picks between patches (A/B before a setting exists).
+    const char* env_value_env = nullptr;
+    std::string_view env_value{};
     /// When set, the patch applies (and is listed in Add-Ons) only while this returns true.
     bool (*setting_enabled)() = nullptr;
     /// Another built-in this one contains: skipped once this one is applied.
@@ -92,6 +96,26 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .checked = true,
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
+
+// Render scale under Max Resolution (zortos293/Lichii#903): that path returns 1.0 of the display
+// size from main+0x806420 (movz w9, #0x3f80, lsl 16 = 1.0f, 0x52A7F009); the scene then renders
+// at 1.0 x the handheld 1920x1080 (or docked 2560x1440) and the game's own scaler draws it to the
+// display. Loading a lower scale there renders fewer pixels for the same display output, and the
+// game's scaler (or our temporal upscaler) covers the rest: 0.5 is a quarter of the fragments of
+// 1.0, which is the largest lever the emulator has on a GPU-bound scene. #903 picks it from the
+// DLSS mode; here EDEN_NX2_OOT_RENDER_SCALE=0.87|0.75|0.5 does, before it becomes a setting.
+constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // 0x3f5f0000, 0.871
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // 0x3f400000, 0.75
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // 0x3f000000, 0.5
+constexpr auto MakeRenderScaleRecords = [](const std::array<u8, 4>& scale) {
+    return std::array{BuiltinPatchRecord{.module_offset = 0x806420,
+                                         .bytes = scale,
+                                         .checked = true,
+                                         .original = 0x52A7F009}};
+};
+constexpr auto RENDER_BALANCED_RECORDS = MakeRenderScaleRecords(RENDER_SCALE_BALANCED);
+constexpr auto RENDER_PERFORMANCE_RECORDS = MakeRenderScaleRecords(RENDER_SCALE_PERFORMANCE);
+constexpr auto RENDER_ULTRA_RECORDS = MakeRenderScaleRecords(RENDER_SCALE_ULTRA);
 
 // Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
 // the time measured with the system counter instead of assuming 30 fps, so it runs at full speed
@@ -267,6 +291,34 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
         .disable_env = "EDEN_NX2_NO_MAX_RES",
+    },
+    // Under Max Resolution: the environment variable picks one of the three render scales.
+    BuiltinPatch{
+        .name = "Render scale 0.87 (built-in, EDEN_NX2_OOT_RENDER_SCALE=0.87)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_BALANCED_RECORDS,
+        .env_value_env = "EDEN_NX2_OOT_RENDER_SCALE",
+        .env_value = "0.87",
+    },
+    BuiltinPatch{
+        .name = "Render scale 0.75 (built-in, EDEN_NX2_OOT_RENDER_SCALE=0.75)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .env_value_env = "EDEN_NX2_OOT_RENDER_SCALE",
+        .env_value = "0.75",
+    },
+    BuiltinPatch{
+        .name = "Render scale 0.5 (built-in, EDEN_NX2_OOT_RENDER_SCALE=0.5)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .env_value_env = "EDEN_NX2_OOT_RENDER_SCALE",
+        .env_value = "0.5",
     },
     // Before Dark's: it contains his routine and replaces it while applied. Off by default; only
     // listed in Add-Ons while the setting is on.
@@ -796,6 +848,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.enable_env != nullptr) {
             const char* const value = std::getenv(patch.enable_env);
             if (value == nullptr || std::string_view{value} != "1") {
+                continue;
+            }
+        }
+        if (patch.env_value_env != nullptr) {
+            const char* const value = std::getenv(patch.env_value_env);
+            if (value == nullptr || std::string_view{value} != patch.env_value) {
                 continue;
             }
         }
